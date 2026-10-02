@@ -1,0 +1,12 @@
+[package]
+name = "parallelos"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "parallelos"
+path = "src/lib.rs"
+
+[dependencies]
+crossbeam = "0.8.5"
+anyhow = "1.0.104"
