@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Error, Result};
 use crossbeam::channel::Receiver;
 use std::any::Any;
 
@@ -15,7 +15,7 @@ enum JobResult<T> {
 // Represents a handle to a submitted job,
 // allowing the caller to wait for its completion and retrieve the result
 pub struct JobHandle<T> {
-    pub rx: Receiver<JobResult<T>>,
+    rx: Receiver<JobResult<T>>,
 }
 
 impl<T> JobHandle<T> {

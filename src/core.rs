@@ -1,11 +1,13 @@
-use crate::Job;
+use crate::{Job, SharedState};
 use crate::jobs::JobHandle;
 use crate::worker::WorkerHandle;
 use anyhow::Result;
-use std::sync::mpsc::Sender;
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 pub struct Pool {
-    workers: Box<[WorkerHandle]>,
+    shared: Arc<SharedState>,
+    threads: Arc<[JoinHandle<()>]>,
 }
 
 impl Pool {
@@ -15,15 +17,15 @@ impl Pool {
     }
 
     pub fn init_with(n: usize) -> Result<Self> {
-        let worker_handles: Vec<Sender<Job>> = (0..n)
+        let worker_handles: Vec<JoinHandle<()>> = (0..n)
             .map(|_| {
                 let (worker, tx) = WorkerHandle::init();
-                std::thread::spawn(move || worker.run_jobs());
+                let handle = std::thread::spawn(move || worker.run_jobs());
                 tx
             })
-            .collect::<Result<_, _>>()?;
         Ok(Pool {
-            workers: worker_handles.into_boxed_slice(),
+            shared: Arc::new(SharedState { tx: Arc::new([]), shutdown_flag: Default::default() }),
+            threads: Arc::from(worker_handles),
         })
     }
 
@@ -34,4 +36,9 @@ impl Pool {
     pub fn stats() {}
 
     pub fn shutdown(&mut self) {}
+}
+
+enum PoolError {
+    Closed,
+    ThreadPanic,
 }
