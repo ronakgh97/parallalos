@@ -1,31 +1,29 @@
-use anyhow::{Error, Result};
+use anyhow::{Result, anyhow};
 use crossbeam::channel::Receiver;
 use std::any::Any;
 
-// Represents the result of a job execution
-enum JobResult<T> {
-    /// The job completed successfully with a result of type T
+/// Result of a submitted job, as reported back by the worker that ran it.
+pub(crate) enum JobResult<T> {
+    /// The job ran successfully containing the return value
     Success(T),
-    /// The job was interrupted before completion
-    Interrupt,
     /// The job panicked during execution, containing the panic payload
     Panic(Box<dyn Any + Send + 'static>), // from std::thread::Result
 }
 
-// Represents a handle to a submitted job,
-// allowing the caller to wait for its completion and retrieve the result
+/// Handle to a submitted job, used to await its result.
 pub struct JobHandle<T> {
     rx: Receiver<JobResult<T>>,
 }
 
 impl<T> JobHandle<T> {
-    /// Waits for the job to complete and returns the result
+    /// Blocks until the job reports a result.
+    /// Panics are `re-raised` in the waiting thread
+    /// rather than returned as an error using `std::panic::catch_unwind` and `std::panic::resume_unwind`.
     pub fn wait(self) -> Result<T> {
         match self.rx.recv() {
             Ok(JobResult::Success(s)) => Ok(s),
-            Ok(JobResult::Interrupt) => Err(anyhow::anyhow!("Job was interrupted")),
             Ok(JobResult::Panic(e)) => std::panic::resume_unwind(e),
-            Err(e) => panic!("Failed to receive job result: {}", e),
+            Err(e) => Err(anyhow!("worker failed to send job result: {e}")),
         }
     }
 }
