@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow};
 use crossbeam::channel::Receiver;
 use std::any::Any;
 
-/// Result of a submitted job, as reported back by the worker that ran it.
+/// Result of a submitted job, as reported back by the worker that ran it
 pub(crate) enum JobResult<T> {
     /// The job ran successfully containing the return value
     Success(T),
@@ -10,7 +10,7 @@ pub(crate) enum JobResult<T> {
     Panic(Box<dyn Any + Send + 'static>), // from std::thread::Result
 }
 
-/// Handle to a submitted job, used to await its result.
+/// Handle to a submitted job, used to await its result
 pub struct JobHandle<T> {
     rx: Receiver<JobResult<T>>,
 }
