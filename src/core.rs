@@ -28,6 +28,14 @@ pub struct Pool {
     worker_threads: Vec<JoinHandle<()>>,
 }
 
+/// Snapshot of a worker's current state, used for monitoring and scheduling decisions
+pub struct WorkerState {
+    pub task_load: u64,
+    pub task_queued: u64,
+    pub task_executed: u64,
+    pub ewa_execution_time: u64,
+}
+
 impl Pool {
     /// Creates a new worker pool with the number of threads equal to the number of available CPU cores
     pub fn init() -> Result<Self> {
@@ -60,12 +68,12 @@ impl Pool {
 
         // TODO: improve this later
         let mut best_idx = 0;
-        let mut best_ties = 0u64;
+        let mut best_ties = 0u32;
         let mut best_load = u64::MAX;
         let mut best_time = u64::MAX;
 
         for (i, worker) in self.worker_handles.iter().enumerate() {
-            let load = worker.stats.tasks_load.load(Ordering::Relaxed);
+            let load = worker.stats.task_load.load(Ordering::Relaxed);
             let time = worker.stats.ewma_execution_time.load(Ordering::Relaxed);
 
             match (load, time).cmp(&(best_load, best_time)) {
@@ -81,8 +89,7 @@ impl Pool {
 
                     // randomly select one of the tied workers
                     // probability is same for each worker
-                    let chance = 1.0 / (best_ties as f64);
-                    if rand::random_bool(chance) {
+                    if rand::random_ratio(1, best_ties) {
                         best_idx = i;
                     }
                 }
@@ -103,6 +110,8 @@ impl Pool {
         self.submit_with_cost(f, 1)
     }
 
+    // TODO: fn submit_batch()
+
     /// Submits a task to the pool with an approximate execution cost
     /// and returns a handle for awaiting its result
     pub fn submit_with_cost<F, T>(&self, f: F, cost: u64) -> Result<TaskHandle<T>>
@@ -113,11 +122,14 @@ impl Pool {
         let index = self
             .schedule_worker()
             .ok_or_else(|| anyhow!("worker pool has been shut down"))?;
-        let cost = cost.clamp(1, 1 << 20);
+        let cost = cost.clamp(1, 1 << 20); // 1048576 is to avoid overflow in fetch_add
 
-        self.worker_handles[index]
+        // safety: we already checked that index is valid, this is free perf
+        let worker_tx_handle = unsafe { self.worker_handles.get_unchecked(index) };
+
+        worker_tx_handle
             .stats
-            .tasks_load
+            .task_load
             .fetch_add(cost, Ordering::Relaxed);
         let (rtx, rrx) = bounded(1);
         let task = Task {
@@ -126,19 +138,34 @@ impl Pool {
         };
 
         // send the task to selected worker queue
-        self.worker_handles[index]
-            .tx
-            .send(task)
-            .map_err(|_| anyhow!("worker has been stopped"))?;
+        if let Err(_) = worker_tx_handle.tx.send(task) {
+            // avoid leaking task load
+            // if the worker has been dropped somehow maybe
+            worker_tx_handle
+                .stats
+                .task_load
+                .fetch_sub(cost, Ordering::Relaxed);
+            return Err(anyhow!("worker pool has been shut down"));
+        }
 
         // hand the result_rx to the caller, so they can wait for the result
         Ok(TaskHandle { rx: rrx })
     }
 
-    /// Returns the current statistics for the worker pool.
-    pub fn stats(&self) {}
+    /// Returns the current states for the worker in the pool
+    pub fn stats(&self) -> Vec<WorkerState> {
+        self.worker_handles
+            .iter()
+            .map(|w| WorkerState {
+                task_load: w.stats.task_load.load(Ordering::Relaxed),
+                task_queued: w.tx.len() as u64,
+                task_executed: w.stats.task_executed.load(Ordering::Relaxed),
+                ewa_execution_time: w.stats.ewma_execution_time.load(Ordering::Relaxed),
+            })
+            .collect()
+    }
 
-    /// Stops accepting work, waits for all queued tasks to complete.
+    /// Stops accepting task, waits for all queued tasks to complete
     pub fn shutdown(&mut self) -> Result<()> {
         // drop all senders, workers will exit when their queues drain
         self.worker_handles.clear();
@@ -159,6 +186,8 @@ impl Pool {
         }
         Ok(())
     }
+
+    // TODO: fn shutdown_timeout()
 }
 
 impl Drop for Pool {

@@ -11,3 +11,16 @@ path = "src/lib.rs"
 crossbeam = "0.8.5"
 rand = "0.10.3"
 anyhow = "1.0.104"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = true
+incremental = false
+debug = false
+
+[profile.dev]
+opt-level = 1
+debug = true
+incremental = true

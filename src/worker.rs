@@ -26,7 +26,7 @@ pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
             {
                 let load = task.cost;
                 (task.exec)(); // execute the task, return value to taskHandle via inner channel
-                thread_stats.tasks_load.fetch_sub(load, Ordering::Relaxed);
+                thread_stats.task_load.fetch_sub(load, Ordering::Relaxed);
             }
             thread_stats.task_executed.fetch_add(1, Ordering::Relaxed);
             let elapsed = start.elapsed().as_nanos() as u64;
@@ -36,16 +36,17 @@ pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
     (WorkerHandle { tx, stats }, thread_handle)
 }
 
-/// Stats of worker, needed to schedular tasks to suitable worker thread
+/// Stats of worker, needed for scheduling tasks to suitable worker thread
 #[derive(Default)]
 pub struct WorkerStats {
-    pub tasks_load: AtomicU64,
+    pub task_load: AtomicU64,
     pub task_executed: AtomicU64,
     pub ewma_execution_time: AtomicU64,
 }
 
 impl WorkerStats {
     /// Update the exponentially weighted `moving average` of execution time
+    #[inline(always)]
     fn update_ewa(&self, elapsed: u64) {
         // formula: (elapsed * a + old_ewa * (1 - a))
         const ALPHA: f64 = 1.0 / 16.0;
