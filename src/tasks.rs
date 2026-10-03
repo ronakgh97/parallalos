@@ -24,6 +24,7 @@ impl<T> TaskHandle<T> {
         match self.rx.recv() {
             Ok(TaskResult::Success(s)) => Ok(s),
             Ok(TaskResult::Panic(e)) => std::panic::resume_unwind(e),
+            // sender has been dropped, worker thread has panicked or exited
             Err(e) => Err(anyhow!("worker failed to send task result: {e}")),
         }
     }
