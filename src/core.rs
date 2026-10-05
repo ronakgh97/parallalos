@@ -28,7 +28,8 @@ pub struct Pool {
     worker_threads: Vec<JoinHandle<()>>,
 }
 
-/// Snapshot of a worker's current state, used for monitoring and scheduling decisions
+/// Snapshot of a worker's current state, used for `monitoring` and `scheduling` decisions
+#[derive(Debug, Clone, Copy)]
 pub struct WorkerState {
     pub task_load: u64,
     pub task_queued: u64,
@@ -37,12 +38,12 @@ pub struct WorkerState {
 }
 
 impl Pool {
-    /// Creates a new worker pool with the number of threads equal to the number of available CPU cores
+    /// Creates a new worker pool with the number of threads equal to the `number of available CPU cores`.
     pub fn init() -> Result<Self> {
         Self::init_with(std::thread::available_parallelism()?.get())
     }
 
-    /// Creates a new worker pool with the specified number of threads
+    /// Creates a new worker pool with the `specified number of threads`.
     pub fn init_with(n: usize) -> Result<Self> {
         let (handles, threads) = (0..n)
             .into_iter()
@@ -58,7 +59,7 @@ impl Pool {
         })
     }
 
-    /// Returns the index of worker for assigning the task
+    /// Returns the index of worker for assigning the task.
     #[inline(always)]
     fn schedule_worker(&self) -> Option<usize> {
         let n = self.worker_handles.len();
@@ -68,10 +69,12 @@ impl Pool {
 
         // TODO: improve this later
         let mut best_idx = 0;
-        let mut best_ties = 0u32;
+        let mut best_ties = 0;
         let mut best_load = u64::MAX;
         let mut best_time = u64::MAX;
 
+        // find the worker with least load + EWMA execution time
+        // if they tie, randomly select one of the tied workers
         for (i, worker) in self.worker_handles.iter().enumerate() {
             let load = worker.stats.task_load.load(Ordering::Relaxed);
             let time = worker.stats.ewma_execution_time.load(Ordering::Relaxed);
@@ -89,19 +92,23 @@ impl Pool {
 
                     // randomly select one of the tied workers
                     // probability is same for each worker
-                    if rand::random_ratio(1, best_ties) {
+                    if fastrand::usize(0..best_ties) == 0 {
                         best_idx = i;
                     }
                 }
 
-                std::cmp::Ordering::Greater => { /*do nothing*/ }
+                std::cmp::Ordering::Greater => { /* do nothing */ }
             }
         }
 
         Some(best_idx)
     }
 
-    /// Submits a task to the pool and returns a handle to await its result
+    // TODO: fn add_worker()
+
+    // TODO: fn remove_worker()
+
+    /// Submits a task to the pool with cost: 1 and returns a handle to await its result.
     pub fn submit<F, T>(&self, f: F) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -113,7 +120,7 @@ impl Pool {
     // TODO: fn submit_batch()
 
     /// Submits a task to the pool with an approximate execution cost
-    /// and returns a handle for awaiting its result
+    /// and returns a handle for awaiting its result or errors if Pool is shut down.
     pub fn submit_with_cost<F, T>(&self, f: F, cost: u64) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -138,9 +145,8 @@ impl Pool {
         };
 
         // send the task to selected worker queue
-        if let Err(_) = worker_tx_handle.tx.send(task) {
-            // avoid leaking task load
-            // if the worker has been dropped somehow maybe
+        if worker_tx_handle.tx.send(task).is_err() {
+            // task was dropped, release the charge that `task_load` was tracking
             worker_tx_handle
                 .stats
                 .task_load
@@ -152,7 +158,28 @@ impl Pool {
         Ok(TaskHandle { rx: rrx })
     }
 
-    /// Returns the current states for the worker in the pool
+    /// Waits for all submitted tasks to complete.
+    ///
+    /// This method `blocks until all tasks submitted before/after` this call are completed.
+    /// It does not block `submit` calls that happen after this call.
+    pub fn wait_all_tasks(&self) {
+        loop {
+            let total_load: u64 = self
+                .worker_handles
+                .iter()
+                .map(|w| w.stats.task_load.load(Ordering::Relaxed))
+                .sum(); // TODO: race condition here
+
+            // block for all worker load to drain to zero
+            if total_load == 0 {
+                break;
+            }
+
+            std::thread::yield_now(); // TODO: busy-wait here
+        }
+    }
+
+    /// Returns the current states for the worker in the pool.
     pub fn stats(&self) -> Vec<WorkerState> {
         self.worker_handles
             .iter()
@@ -165,14 +192,14 @@ impl Pool {
             .collect()
     }
 
-    /// Stops accepting task, waits for all queued tasks to complete
+    /// Stops accepting `submit` calls, waits for all queued tasks to complete.
     pub fn shutdown(&mut self) -> Result<()> {
         // drop all senders, workers will exit when their queues drain
         self.worker_handles.clear();
 
         let mut thread_panicked = 0u64;
         for threads in self.worker_threads.drain(..) {
-            if let Err(_) = threads.join() {
+            if threads.join().is_err() {
                 // eprintln!("worker thread panicked: {:?}", e);
                 thread_panicked += 1;
             }

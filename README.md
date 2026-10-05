@@ -1,0 +1,1 @@
+**parallelos** is a task scheduler for massively parallel computing
