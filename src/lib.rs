@@ -1,16 +1,18 @@
-pub mod core;
+use crate::tasks::TaskCost;
+
+pub mod pool;
 pub mod tasks;
 pub(crate) mod worker;
 
-/// A unit of work to be executed by a worker thread.
+/// A unit of work to be executed by a worker thread
 pub(crate) struct Task {
-    pub cost: u64,
-    pub exec: Box<dyn FnOnce() + Send + 'static>,
+    pub cost: TaskCost,
+    pub exec: Box<dyn FnOnce() + Send + 'static>, // closure that capture callable
 }
 
 #[test]
 fn test() {
-    let pool = core::Pool::init_with(4).unwrap();
+    let pool = pool::WorkerPool::init_with(4).unwrap();
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     let _task_handles: Vec<_> = (0..100)

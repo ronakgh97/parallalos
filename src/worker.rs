@@ -23,14 +23,15 @@ pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
     let thread_handle = std::thread::spawn(move || {
         while let Ok(task) = rx.recv() {
             let start = std::time::Instant::now();
-            {
-                let load = task.cost;
-                (task.exec)(); // execute the task, return value to taskHandle via inner channel
-                thread_stats.task_load.fetch_sub(load, Ordering::Relaxed);
-            }
-            thread_stats.task_executed.fetch_add(1, Ordering::Relaxed);
+            (task.exec)(); // execute the task, return value to taskHandle via inner channel
             let elapsed = start.elapsed().as_nanos() as u64;
-            thread_stats.update_ewa(elapsed);
+            thread_stats
+                .total_task_cost
+                .fetch_sub(task.cost.to_value(), Ordering::Relaxed);
+            thread_stats
+                .total_task_executed
+                .fetch_add(1, Ordering::Relaxed);
+            thread_stats.update_ewa(elapsed, task.cost.to_value());
         }
     });
     (WorkerHandle { tx, stats }, thread_handle)
@@ -39,20 +40,21 @@ pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
 /// Stats of worker, needed for scheduling tasks to suitable worker thread
 #[derive(Default)]
 pub struct WorkerStats {
-    pub task_load: AtomicU64,
-    pub task_executed: AtomicU64,
-    pub ewma_execution_time: AtomicU64,
+    pub total_task_cost: AtomicU64,
+    pub total_task_executed: AtomicU64,
+    pub ewma_exec_time_per_task: AtomicU64,
 }
 
 impl WorkerStats {
-    /// Update the exponentially weighted `moving average` of execution time
+    /// Update the exponentially weighted `moving average` of execution time per task cost
     #[inline(always)]
-    fn update_ewa(&self, elapsed: u64) {
-        // formula: (elapsed * a + old_ewa * (1 - a))
-        const ALPHA: f64 = 1.0 / 16.0;
-        let current = self.ewma_execution_time.load(Ordering::Relaxed) as f64;
-        let new_ewa = ALPHA * (elapsed as f64) + (1.0 - ALPHA) * current;
-        self.ewma_execution_time
+    fn update_ewa(&self, elapsed: u64, cost: u64) {
+        // formula: new_ewa = variable * alpha + old_ewa * (1 - alpha)
+        const ALPHA: f64 = 1.0 / 8.0;
+        let variable = (elapsed >> cost) as f64; // power of 2; bit shift
+        let current = self.ewma_exec_time_per_task.load(Ordering::Relaxed) as f64;
+        let new_ewa = ALPHA * (variable) + (1.0 - ALPHA) * current;
+        self.ewma_exec_time_per_task
             .store(new_ewa as u64, Ordering::Relaxed);
     }
 }
