@@ -18,7 +18,11 @@ pub struct WorkerHandle {
 /// therefore this drains the channel even if schedular has drop tx_handles, and return on empty channel.
 pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
     let (tx, rx) = crossbeam::channel::unbounded::<Task>();
-    let stats = Arc::from(WorkerStats::default());
+    let stats = Arc::new(WorkerStats {
+        total_task_cost: AtomicU64::new(0),
+        total_task_executed: AtomicU64::new(0),
+        ewma_exec_time_per_task: AtomicU64::new(1), // 0 would cause weird behavior on cold start worker
+    });
     let thread_stats = Arc::clone(&stats);
     let thread_handle = std::thread::spawn(move || {
         while let Ok(task) = rx.recv() {
@@ -38,7 +42,6 @@ pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
 }
 
 /// Stats of worker, needed for scheduling tasks to suitable worker thread
-#[derive(Default)]
 pub struct WorkerStats {
     pub total_task_cost: AtomicU64,
     pub total_task_executed: AtomicU64,
@@ -52,7 +55,7 @@ impl WorkerStats {
     fn update_ewa(&self, elapsed: u64, cost: u64) {
         // formula; new_ewa = observed variable * alpha + old_ewa * (1 - alpha)
         const ALPHA: f64 = 1.0 / 8.0;
-        let variable = ((elapsed + (1 << cost.ilog2()) - 1) >> cost.ilog2()) as f64; // div_ceil(elapsed / cost)
+        let variable = ((elapsed + (1 << cost.ilog2()) - 1) >> cost.ilog2()) as f64; // div_ceil(elapsed, cost)
         let current = self.ewma_exec_time_per_task.load(Ordering::Relaxed) as f64;
         let new_ewa = ALPHA * (variable) + (1.0 - ALPHA) * current;
         self.ewma_exec_time_per_task

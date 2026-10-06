@@ -136,8 +136,7 @@ impl WorkerPool {
             .ok_or_else(|| anyhow!("worker pool has been shut down"))?;
         let cost_value = cost.to_value();
 
-        // safety: we already checked that index is valid, this is free runtime perf
-        let worker_tx_handle = unsafe { self.worker_handles.get_unchecked(index) };
+        let worker_tx_handle = &self.worker_handles[index];
         worker_tx_handle
             .stats
             .total_task_cost
