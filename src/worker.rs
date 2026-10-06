@@ -46,12 +46,13 @@ pub struct WorkerStats {
 }
 
 impl WorkerStats {
-    /// Update the exponentially weighted `moving average` of execution time per task cost
+    /// Update the exponentially weighted `moving average` of execution time
+    /// per cost unit, i.e. observed nanos per unit of declared `TaskCost` weight.
     #[inline(always)]
     fn update_ewa(&self, elapsed: u64, cost: u64) {
-        // formula: new_ewa = variable * alpha + old_ewa * (1 - alpha)
+        // formula; new_ewa = observed variable * alpha + old_ewa * (1 - alpha)
         const ALPHA: f64 = 1.0 / 8.0;
-        let variable = (elapsed >> cost) as f64; // power of 2; bit shift
+        let variable = ((elapsed + (1 << cost.ilog2()) - 1) >> cost.ilog2()) as f64; // div_ceil(elapsed / cost)
         let current = self.ewma_exec_time_per_task.load(Ordering::Relaxed) as f64;
         let new_ewa = ALPHA * (variable) + (1.0 - ALPHA) * current;
         self.ewma_exec_time_per_task

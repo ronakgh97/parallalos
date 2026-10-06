@@ -1,5 +1,5 @@
 use crate::Task;
-use crate::tasks::{TaskHandle, TaskResult};
+use crate::tasks::{TaskCost, TaskHandle, TaskResult};
 use crate::worker::{WorkerHandle, init_worker};
 use anyhow::{Result, anyhow};
 use crossbeam::channel::bounded;
@@ -23,7 +23,7 @@ macro_rules! exec_task {
 }
 
 /// A pool of worker threads that can schedule/execute tasks concurrently
-pub struct Pool {
+pub struct WorkerPool {
     worker_handles: Vec<WorkerHandle>,
     worker_threads: Vec<JoinHandle<()>>,
 }
@@ -31,20 +31,24 @@ pub struct Pool {
 /// Snapshot of a worker's current state, used for `monitoring` and `scheduling` decisions
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerState {
-    pub task_load: u64,
-    pub task_queued: u64,
-    pub task_executed: u64,
-    pub ewa_execution_time: u64,
+    pub tasks_cost: u64,
+    pub tasks_queued: u64,
+    pub tasks_executed: u64,
+    pub ewa_exec_time_per_task: u64,
+    pub predicted_completion_time: u64,
 }
 
-impl Pool {
+impl WorkerPool {
     /// Creates a new worker pool with the number of threads equal to the `number of available CPU cores`.
     pub fn init() -> Result<Self> {
-        Self::init_with(std::thread::available_parallelism()?.get())
+        let thread_count = std::thread::available_parallelism()?.get();
+        assert!(thread_count > 1, "worker pool must have at least 2 threads");
+        Self::init_with(thread_count)
     }
 
     /// Creates a new worker pool with the `specified number of threads`.
     pub fn init_with(n: usize) -> Result<Self> {
+        assert!(n > 1, "worker pool must have at least 2 threads");
         let (handles, threads) = (0..n)
             .into_iter()
             .map(|_| {
@@ -53,7 +57,7 @@ impl Pool {
             })
             .collect();
 
-        Ok(Pool {
+        Ok(WorkerPool {
             worker_handles: handles,
             worker_threads: threads,
         })
@@ -67,61 +71,62 @@ impl Pool {
             return None;
         }
 
-        // TODO: improve this later
-        let mut best_idx = 0;
-        let mut best_ties = 0;
-        let mut best_load = u64::MAX;
-        let mut best_time = u64::MAX;
+        // rand sample two distinct workers and pick the one
+        // with the lesser `total_tasks_cost (queued/running) * ewma_execution_time_per_task_cost`
+        // i.e. find the worker that is predicted to complete it task faster
+        let a = fastrand::usize(..n);
+        let b = {
+            let b = fastrand::usize(..n - 1);
+            if b >= a { b + 1 } else { b }
+        };
 
-        // find the worker with least load + EWMA execution time
-        // if they tie, randomly select one of the tied workers
-        for (i, worker) in self.worker_handles.iter().enumerate() {
-            let load = worker.stats.task_load.load(Ordering::Relaxed);
-            let time = worker.stats.ewma_execution_time.load(Ordering::Relaxed);
+        // the rank is a predicted time (in nanos) to drain this worker task queue
+        let (wa, wb) = (&self.worker_handles[a], &self.worker_handles[b]);
+        let rank_a = wa
+            .stats
+            .total_task_cost
+            .load(Ordering::Relaxed)
+            .saturating_mul(wa.stats.ewma_exec_time_per_task.load(Ordering::Relaxed));
 
-            match (load, time).cmp(&(best_load, best_time)) {
-                std::cmp::Ordering::Less => {
-                    best_load = load;
-                    best_time = time;
-                    best_idx = i;
-                    best_ties = 1;
-                }
+        let rank_b = wb
+            .stats
+            .total_task_cost
+            .load(Ordering::Relaxed)
+            .saturating_mul(wb.stats.ewma_exec_time_per_task.load(Ordering::Relaxed));
 
-                std::cmp::Ordering::Equal => {
-                    best_ties += 1;
-
-                    // randomly select one of the tied workers
-                    // probability is same for each worker
-                    if fastrand::usize(0..best_ties) == 0 {
-                        best_idx = i;
-                    }
-                }
-
-                std::cmp::Ordering::Greater => { /* do nothing */ }
-            }
+        if rank_a > rank_b {
+            Some(b)
+        } else if rank_a < rank_b {
+            Some(a)
+        } else {
+            let coin_flip = fastrand::bool(); // 50/50 on tie
+            if coin_flip { Some(a) } else { Some(b) }
         }
-
-        Some(best_idx)
     }
 
     // TODO: fn add_worker()
 
     // TODO: fn remove_worker()
 
-    /// Submits a task to the pool with cost: 1 and returns a handle to await its result.
+    /// Submits a task to the pool with `TaskCost::Normal` and returns a handle to await its result.
+    ///
+    /// Use `submit_with_cost` if you want to specify a different cost for the task.
     pub fn submit<F, T>(&self, f: F) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        self.submit_with_cost(f, 1)
+        self.submit_with_cost(f, TaskCost::Normal)
     }
 
     // TODO: fn submit_batch()
 
-    /// Submits a task to the pool with an approximate execution cost
+    /// Submits a task to the pool with an `TaskCost`,
+    /// i.e. how heavy the task is expected to be, in range of `Normal` to `VeryHigh`
     /// and returns a handle for awaiting its result or errors if Pool is shut down.
-    pub fn submit_with_cost<F, T>(&self, f: F, cost: u64) -> Result<TaskHandle<T>>
+    ///
+    /// > TaskCost affecting behavior of schedular will change or removed in the future
+    pub fn submit_with_cost<F, T>(&self, f: F, cost: TaskCost) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
@@ -129,15 +134,15 @@ impl Pool {
         let index = self
             .schedule_worker()
             .ok_or_else(|| anyhow!("worker pool has been shut down"))?;
-        let cost = cost.clamp(1, 1 << 20); // 1048576 is to avoid overflow in fetch_add
+        let cost_value = cost.to_value();
 
-        // safety: we already checked that index is valid, this is free perf
+        // safety: we already checked that index is valid, this is free runtime perf
         let worker_tx_handle = unsafe { self.worker_handles.get_unchecked(index) };
-
         worker_tx_handle
             .stats
-            .task_load
-            .fetch_add(cost, Ordering::Relaxed);
+            .total_task_cost
+            .fetch_add(cost_value, Ordering::Relaxed);
+
         let (rtx, rrx) = bounded(1);
         let task = Task {
             cost,
@@ -149,8 +154,8 @@ impl Pool {
             // task was dropped, release the charge that `task_load` was tracking
             worker_tx_handle
                 .stats
-                .task_load
-                .fetch_sub(cost, Ordering::Relaxed);
+                .total_task_cost
+                .fetch_sub(cost_value, Ordering::Relaxed);
             return Err(anyhow!("worker pool has been shut down"));
         }
 
@@ -167,7 +172,7 @@ impl Pool {
             let total_load: u64 = self
                 .worker_handles
                 .iter()
-                .map(|w| w.stats.task_load.load(Ordering::Relaxed))
+                .map(|w| w.stats.total_task_cost.load(Ordering::Relaxed))
                 .sum(); // TODO: race condition here
 
             // block for all worker load to drain to zero
@@ -184,10 +189,15 @@ impl Pool {
         self.worker_handles
             .iter()
             .map(|w| WorkerState {
-                task_load: w.stats.task_load.load(Ordering::Relaxed),
-                task_queued: w.tx.len() as u64,
-                task_executed: w.stats.task_executed.load(Ordering::Relaxed),
-                ewa_execution_time: w.stats.ewma_execution_time.load(Ordering::Relaxed),
+                tasks_queued: w.tx.len() as u64,
+                tasks_cost: w.stats.total_task_cost.load(Ordering::Relaxed),
+                tasks_executed: w.stats.total_task_executed.load(Ordering::Relaxed),
+                ewa_exec_time_per_task: w.stats.ewma_exec_time_per_task.load(Ordering::Relaxed),
+                predicted_completion_time: w
+                    .stats
+                    .total_task_cost
+                    .load(Ordering::Relaxed)
+                    .saturating_mul(w.stats.ewma_exec_time_per_task.load(Ordering::Relaxed)),
             })
             .collect()
     }
@@ -217,7 +227,7 @@ impl Pool {
     // TODO: fn shutdown_timeout()
 }
 
-impl Drop for Pool {
+impl Drop for WorkerPool {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }

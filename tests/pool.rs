@@ -1,5 +1,7 @@
-use parallelos::core::Pool;
-use parallelos::tasks::TaskHandle;
+use parallelos::pool::WorkerPool;
+use parallelos::tasks::{TaskCost, TaskHandle};
+use sha2::Digest;
+use std::hint::black_box;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -16,9 +18,9 @@ fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
     false
 }
 
-fn assert_balanced(p: &Pool) {
+fn assert_balanced(p: &WorkerPool) {
     assert!(
-        wait_until(|| p.stats().iter().all(|w| w.task_load == 0)),
+        wait_until(|| p.stats().iter().all(|w| w.tasks_cost == 0)),
         "task_load never balanced: {:?}",
         p.stats()
     );
@@ -28,9 +30,18 @@ fn assert_balanced(p: &Pool) {
 
 #[test]
 fn loads_balance_after_all_tasks_complete() {
-    let p = Pool::init_with(4).unwrap();
-    let handles: Vec<TaskHandle<u64>> = (1..=64u64)
-        .map(|c| p.submit_with_cost(move || c * c, c).unwrap())
+    let p = WorkerPool::init_with(4).unwrap();
+    let handles: Vec<TaskHandle<u64>> = (0..64u64)
+        .map(|i| {
+            let c = match i % 5 {
+                0 => TaskCost::Low,
+                1 => TaskCost::Normal,
+                2 => TaskCost::Moderate,
+                3 => TaskCost::High,
+                _ => TaskCost::VeryHigh,
+            };
+            p.submit_with_cost(move || i * i, c).unwrap()
+        })
         .collect();
 
     for h in handles {
@@ -38,7 +49,7 @@ fn loads_balance_after_all_tasks_complete() {
     }
 
     assert!(
-        p.stats().iter().all(|w| w.task_load == 0),
+        p.stats().iter().all(|w| w.tasks_cost == 0),
         "unbalanced loads: {:?}",
         p.stats()
     );
@@ -46,23 +57,29 @@ fn loads_balance_after_all_tasks_complete() {
 
 #[test]
 fn fire_and_forget_tasks_still_balance() {
-    let p = Pool::init_with(4).unwrap();
+    let p = WorkerPool::init_with(4).unwrap();
     // drop every handle immediately; nobody waits.
-    for c in 1..=64u64 {
-        let _ = p.submit_with_cost(move || c, c);
+    for i in 0..64u64 {
+        let c = match i % 5 {
+            0 => TaskCost::Low,
+            1 => TaskCost::Normal,
+            2 => TaskCost::Moderate,
+            3 => TaskCost::High,
+            _ => TaskCost::VeryHigh,
+        };
+        let _ = p.submit_with_cost(move || i, c);
     }
     assert_balanced(&p);
 }
 
 #[test]
-fn cost_is_clamped_so_load_never_overflows() {
-    let p = Pool::init_with(1).unwrap();
-    // Without clamping, two fetch_add(u64::MAX) overflows and panics in debug.
-    p.submit_with_cost(|| 1u64, u64::MAX)
+fn low_cost_tasks_count_toward_load() {
+    let p = WorkerPool::init_with(2).unwrap();
+    p.submit_with_cost(|| 1u64, TaskCost::Low)
         .unwrap()
         .wait()
         .unwrap();
-    p.submit_with_cost(|| 2u64, u64::MAX)
+    p.submit_with_cost(|| 2u64, TaskCost::Low)
         .unwrap()
         .wait()
         .unwrap();
@@ -73,7 +90,7 @@ fn cost_is_clamped_so_load_never_overflows() {
 
 #[test]
 fn every_task_returns_its_value() {
-    let p = Pool::init_with(4).unwrap();
+    let p = WorkerPool::init_with(4).unwrap();
     let sum: u64 = (0..64u64)
         .map(|i| p.submit(move || i * i).unwrap())
         .map(|h| h.wait().unwrap())
@@ -84,7 +101,7 @@ fn every_task_returns_its_value() {
 
 #[test]
 fn a_panicking_task_does_not_kill_its_worker() {
-    let p = Pool::init_with(1).unwrap();
+    let p = WorkerPool::init_with(2).unwrap();
 
     let h = p.submit(|| -> () { panic!("boom") }).unwrap();
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -100,14 +117,14 @@ fn a_panicking_task_does_not_kill_its_worker() {
 
 #[test]
 fn submit_after_shutdown_is_refused() {
-    let mut p = Pool::init_with(2).unwrap();
+    let mut p = WorkerPool::init_with(2).unwrap();
     p.shutdown().unwrap();
     assert!(p.submit(|| 1).is_err());
 }
 
 #[test]
 fn drop_without_shutdown_still_completes_tasks() {
-    let p = Pool::init_with(2).unwrap();
+    let p = WorkerPool::init_with(2).unwrap();
     let h = p.submit(|| 42u64).unwrap();
     drop(p); // Drop runs shutdown(), which drains the queue and runs the task.
     assert_eq!(h.wait().unwrap(), 42);
@@ -115,7 +132,7 @@ fn drop_without_shutdown_still_completes_tasks() {
 
 #[test]
 fn shutdown_drains_queued_tasks_without_waiting() {
-    let mut p = Pool::init_with(4).unwrap();
+    let mut p = WorkerPool::init_with(4).unwrap();
     for _ in 0..200 {
         let _ = p.submit(|| ());
     }
@@ -127,7 +144,7 @@ fn shutdown_drains_queued_tasks_without_waiting() {
 
 #[test]
 fn concurrent_submit_balances() {
-    let p = Arc::new(Pool::init_with(4).unwrap());
+    let p = Arc::new(WorkerPool::init_with(4).unwrap());
 
     let expected: u64 = (0..4u64)
         .flat_map(|t| (0..64u64).map(move |i| t * 1000 + i))
@@ -153,8 +170,43 @@ fn concurrent_submit_balances() {
     assert_eq!(actual, expected);
 
     assert!(
-        wait_until(|| p.stats().iter().all(|w| w.task_load == 0)),
+        wait_until(|| p.stats().iter().all(|w| w.tasks_cost == 0)),
         "task_load never balanced: {:?}",
         p.stats()
+    );
+}
+
+// Reference perf point for later refactors, not a correctness test
+#[test]
+fn perf_regress_reference() {
+    let p = WorkerPool::init_with(8).unwrap();
+
+    const TASK_COUNT: usize = 178956; // MAGIC NUMBER, DO NOT CHANGE!!!
+
+    let start = Instant::now();
+    for _ in 0..TASK_COUNT {
+        if fastrand::bool() {
+            p.submit_with_cost(
+                || black_box(sha2::Sha256::digest(b"hash payload")),
+                TaskCost::High,
+            )
+            .unwrap();
+        } else {
+            p.submit_with_cost(|| black_box(hex::encode(b"hex payload")), TaskCost::Low)
+                .unwrap();
+        }
+    }
+    println!(
+        "workers stats after submitting {TASK_COUNT} tasks: {:?}",
+        p.stats()
+    );
+    p.wait_all_tasks();
+    let elapsed = start.elapsed();
+
+    let baseline = Duration::from_millis(110);
+    assert!(
+        elapsed < baseline,
+        "perf regression: took {:?} to complete {TASK_COUNT} tasks",
+        elapsed
     );
 }

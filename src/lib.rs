@@ -11,7 +11,7 @@ pub(crate) struct Task {
 }
 
 #[test]
-fn test() {
+fn lib_test() {
     let pool = pool::WorkerPool::init_with(4).unwrap();
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
