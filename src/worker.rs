@@ -21,7 +21,7 @@ pub fn init_worker() -> (WorkerHandle, JoinHandle<()>) {
     let stats = Arc::new(WorkerStats {
         total_task_cost: AtomicU64::new(0),
         total_task_executed: AtomicU64::new(0),
-        ewma_exec_time_per_task: AtomicU64::new(1), // 0 would cause weird behavior on cold start worker
+        ewma_exec_time_per_task: AtomicU64::new(64), // 0 would cause weird behavior on cold start worker
     });
     let thread_stats = Arc::clone(&stats);
     let thread_handle = std::thread::spawn(move || {
@@ -55,7 +55,7 @@ impl WorkerStats {
     fn update_ewa(&self, elapsed: u64, cost: u64) {
         // formula; new_ewa = observed variable * alpha + old_ewa * (1 - alpha)
         const ALPHA: f64 = 1.0 / 8.0;
-        let variable = ((elapsed + (1 << cost.ilog2()) - 1) >> cost.ilog2()) as f64; // div_ceil(elapsed, cost)
+        let variable = ((elapsed + (1 << cost.ilog2()) - 1) >> cost.ilog2()) as f64; // std div_ceil() does "/" and "%" operations
         let current = self.ewma_exec_time_per_task.load(Ordering::Relaxed) as f64;
         let new_ewa = ALPHA * (variable) + (1.0 - ALPHA) * current;
         self.ewma_exec_time_per_task
