@@ -4,9 +4,9 @@ use std::any::Any;
 
 /// Result of a submitted task, as reported back by the worker that ran it
 pub(crate) enum TaskResult<T> {
-    /// The task ran successfully containing the return value
-    Success(T),
-    /// The task panicked during execution, containing the panic payload
+    /// The task ran successfully containing the `return value` and `worker id` that executed it
+    Success(T, usize),
+    /// The task panicked during execution, containing the `panic payload`
     Panic(Box<dyn Any + Send + 'static>), // from std::thread::Result
 }
 
@@ -56,11 +56,14 @@ impl TaskCost {
 impl<T> TaskHandle<T> {
     /// Blocks until the task reports a result.
     ///
+    /// If the task succeeds, returns the return value `T` and the `worker id` that executed it.
     /// If the task panics, the panic is `re-raised` in the waiting thread,
-    /// rather than returned as an error using `std::panic::catch_unwind` and `std::panic::resume_unwind`.
-    pub fn wait(self) -> Result<T> {
+    /// rather than returned as an error using `std::panic::resume_unwind`.
+    ///
+    /// This will error if the worker thread `panicked or exited` before sending the result.
+    pub fn wait(self) -> Result<(T, usize)> {
         match self.rx.recv() {
-            Ok(TaskResult::Success(s)) => Ok(s),
+            Ok(TaskResult::Success(s, id)) => Ok((s, id)),
             Ok(TaskResult::Panic(e)) => std::panic::resume_unwind(e),
             // sender has been dropped, worker thread has panicked or exited
             Err(e) => Err(anyhow!("worker failed to send task result: {e}")),

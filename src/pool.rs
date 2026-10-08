@@ -11,9 +11,9 @@ use std::thread::JoinHandle;
 /// that runs the task and sends back the result
 macro_rules! exec_task {
     ($f:expr, $rtx:expr) => {
-        Box::new(move || {
+        Box::new(move |worker_id: usize| {
             let result = match catch_unwind(AssertUnwindSafe($f)) {
-                Ok(v) => TaskResult::Success(v),
+                Ok(v) => TaskResult::Success(v, worker_id),
                 Err(e) => TaskResult::Panic(e),
             };
 
@@ -34,6 +34,7 @@ pub struct WorkerState {
     pub tasks_cost: u64,
     pub tasks_queued: u64,
     pub tasks_executed: u64,
+    pub tasks_exec_time: u64,
     pub ewa_exec_time_per_task: u64,
     pub predicted_completion_time: u64,
 }
@@ -51,8 +52,8 @@ impl WorkerPool {
         assert!(n > 1, "worker pool must have at least 2 threads");
         let (handles, threads) = (0..n)
             .into_iter()
-            .map(|_| {
-                let (handle, thread) = init_worker();
+            .map(|id| {
+                let (handle, thread) = init_worker(id);
                 (handle, thread)
             })
             .collect();
@@ -86,13 +87,21 @@ impl WorkerPool {
             .stats
             .total_task_cost
             .load(Ordering::Relaxed)
-            .saturating_mul(wa.stats.ewma_exec_time_per_task.load(Ordering::Relaxed));
+            .saturating_mul(
+                wa.stats
+                    .ewma_exec_time_per_task_cost
+                    .load(Ordering::Relaxed),
+            );
 
         let rank_b = wb
             .stats
             .total_task_cost
             .load(Ordering::Relaxed)
-            .saturating_mul(wb.stats.ewma_exec_time_per_task.load(Ordering::Relaxed));
+            .saturating_mul(
+                wb.stats
+                    .ewma_exec_time_per_task_cost
+                    .load(Ordering::Relaxed),
+            );
 
         if rank_a > rank_b {
             Some(b)
@@ -171,7 +180,7 @@ impl WorkerPool {
             let total_load: u64 = self
                 .worker_handles
                 .iter()
-                .map(|w| w.stats.total_task_cost.load(Ordering::Relaxed))
+                .map(|w| w.stats.total_task_cost.load(Ordering::SeqCst))
                 .sum(); // TODO: race condition here
 
             // block for all worker load to drain to zero
@@ -183,7 +192,7 @@ impl WorkerPool {
         }
     }
 
-    /// Returns the current states for the worker in the pool.
+    /// Returns the current state for all worker in the pool.
     pub fn stats(&self) -> Vec<WorkerState> {
         self.worker_handles
             .iter()
@@ -191,15 +200,21 @@ impl WorkerPool {
                 tasks_queued: w.tx.len() as u64,
                 tasks_cost: w.stats.total_task_cost.load(Ordering::Relaxed),
                 tasks_executed: w.stats.total_task_executed.load(Ordering::Relaxed),
-                ewa_exec_time_per_task: w.stats.ewma_exec_time_per_task.load(Ordering::Relaxed),
+                tasks_exec_time: w.stats.total_task_exec_time.load(Ordering::Relaxed),
+                ewa_exec_time_per_task: w
+                    .stats
+                    .ewma_exec_time_per_task_cost
+                    .load(Ordering::Relaxed),
                 predicted_completion_time: w
                     .stats
                     .total_task_cost
                     .load(Ordering::Relaxed)
-                    .saturating_mul(w.stats.ewma_exec_time_per_task.load(Ordering::Relaxed)),
+                    .saturating_mul(w.stats.ewma_exec_time_per_task_cost.load(Ordering::Relaxed)),
             })
             .collect()
     }
+
+    // TODO: pub fn reset_stats() {}
 
     /// Stops accepting `submit` calls, waits for all queued tasks to complete.
     pub fn shutdown(&mut self) -> Result<()> {

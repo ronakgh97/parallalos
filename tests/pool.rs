@@ -93,7 +93,7 @@ fn every_task_returns_its_value() {
     let p = WorkerPool::init_with(4).unwrap();
     let sum: u64 = (0..64u64)
         .map(|i| p.submit(move || i * i).unwrap())
-        .map(|h| h.wait().unwrap())
+        .map(|h| h.wait().unwrap().0)
         .sum();
 
     assert_eq!(sum, (0..64u64).map(|i| i * i).sum());
@@ -109,7 +109,7 @@ fn a_panicking_task_does_not_kill_its_worker() {
     }));
     assert!(caught.is_err(), "panic should cross the thread boundary");
 
-    assert_eq!(p.submit(|| 7u64).unwrap().wait().unwrap(), 7);
+    assert_eq!(p.submit(|| 7u64).unwrap().wait().unwrap().0, 7);
     assert_balanced(&p);
 }
 
@@ -127,7 +127,7 @@ fn drop_without_shutdown_still_completes_tasks() {
     let p = WorkerPool::init_with(2).unwrap();
     let h = p.submit(|| 42u64).unwrap();
     drop(p); // Drop runs shutdown(), which drains the queue and runs the task.
-    assert_eq!(h.wait().unwrap(), 42);
+    assert_eq!(h.wait().unwrap().0, 42);
 }
 
 #[test]
@@ -166,7 +166,7 @@ fn concurrent_submit_balances() {
         .flat_map(|s| s.join().unwrap())
         .collect();
 
-    let actual: u64 = handles.into_iter().map(|h| h.wait().unwrap()).sum();
+    let actual: u64 = handles.into_iter().map(|h| h.wait().unwrap().0).sum();
     assert_eq!(actual, expected);
 
     assert!(
@@ -187,13 +187,16 @@ fn perf_regress_reference() {
     for _ in 0..TASK_COUNT {
         if fastrand::bool() {
             p.submit_with_cost(
-                || black_box(sha2::Sha256::digest(b"hash payload")),
+                || black_box(sha2::Sha256::digest(b"hash payload-123ABC@#&".as_slice())),
                 TaskCost::High,
             )
             .unwrap();
         } else {
-            p.submit_with_cost(|| black_box(hex::encode(b"hex payload")), TaskCost::Low)
-                .unwrap();
+            p.submit_with_cost(
+                || black_box(hex::encode(b"hex payload-123ABC@#&".as_slice())),
+                TaskCost::Low,
+            )
+            .unwrap();
         }
     }
     println!(
