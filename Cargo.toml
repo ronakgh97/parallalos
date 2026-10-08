@@ -20,6 +20,8 @@ anyhow = "1.0.104"
 [dev-dependencies]
 sha2 = "0.11.0"
 hex = "0.4.3"
+aes-gcm = "0.11.1"
+zstd = "0.14.0"
 # core_affinity = "0.8.3"
 # plotters = "0.3.7"
 
@@ -27,11 +29,10 @@ hex = "0.4.3"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
 incremental = false
 debug = false
 
 [profile.dev]
 opt-level = 1
-debug = true
 incremental = true
+debug = "full"
