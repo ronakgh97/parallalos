@@ -2,7 +2,6 @@ use crate::Task;
 use crate::tasks::{TaskCost, TaskHandle, TaskResult};
 use crate::worker::{WorkerHandle, init_worker};
 use anyhow::{Result, anyhow};
-use crossbeam::channel::bounded;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
@@ -26,9 +25,14 @@ macro_rules! exec_task {
 pub struct WorkerPool {
     worker_handles: Vec<WorkerHandle>,
     worker_threads: Vec<JoinHandle<()>>,
+    // this is needed for keeping channel alive, throughout the lifetime of the pool
+    #[allow(unused)]
+    idle_tx: crossbeam::channel::Sender<()>,
+    idle_rx: crossbeam::channel::Receiver<()>,
 }
 
 /// Snapshot of a worker's current state, used for `monitoring` and `scheduling` decisions
+#[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct WorkerState {
     pub tasks_cost: u64,
@@ -50,10 +54,15 @@ impl WorkerPool {
     /// Creates a new worker pool with the `specified number of threads`.
     pub fn init_with(n: usize) -> Result<Self> {
         assert!(n > 1, "worker pool must have at least 2 threads");
+
+        // workers signal on this channel after all task queued are drained,
+        // so that the pool shutdown can wake up when all workers are idle and close gracefully
+        let (idle_tx, idle_rx) = crossbeam::channel::unbounded::<()>();
+
         let (handles, threads) = (0..n)
             .into_iter()
             .map(|id| {
-                let (handle, thread) = init_worker(id);
+                let (handle, thread) = init_worker(id, idle_tx.clone());
                 (handle, thread)
             })
             .collect();
@@ -61,6 +70,8 @@ impl WorkerPool {
         Ok(WorkerPool {
             worker_handles: handles,
             worker_threads: threads,
+            idle_tx,
+            idle_rx,
         })
     }
 
@@ -131,10 +142,10 @@ impl WorkerPool {
     // TODO: fn submit_batch()
 
     /// Submits a task to the pool with an `TaskCost`,
-    /// i.e. how heavy the task is expected to be, in range of `Normal` to `VeryHigh`
+    /// i.e. how heavy the task is expected to be, in range of `Low` to `VeryHigh`
     /// and returns a handle for awaiting its result or errors if Pool is shut down.
     ///
-    /// > TaskCost affecting behavior of schedular will change or removed in the future
+    /// > TaskCost directly affects the behavior of the scheduler and may change or be removed in the future
     pub fn submit_with_cost<F, T>(&self, f: F, cost: TaskCost) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -151,7 +162,7 @@ impl WorkerPool {
             .total_task_cost
             .fetch_add(cost_value, Ordering::Relaxed);
 
-        let (rtx, rrx) = bounded(1);
+        let (rtx, rrx) = crossbeam::channel::bounded(1);
         let task = Task {
             cost,
             exec: exec_task!(f, rtx),
@@ -171,24 +182,32 @@ impl WorkerPool {
         Ok(TaskHandle { rx: rrx })
     }
 
-    /// Waits for all submitted tasks to complete.
+    /// Blocks until the pool has `no queued tasks`, i.e. every worker has
+    /// drained its queue and finished whatever it was running.
     ///
-    /// This method `blocks until all tasks submitted before/after` this call are completed.
-    /// It does not block `submit` calls that happen after this call.
-    pub fn wait_all_tasks(&self) {
+    /// Tasks submitted by `other threads during this call` may also be waited
+    /// on, since the pool simply has to be idle. It does not prevent `submit`.
+    ///
+    /// > This `must not be called` from inside a task run by this pool, or it will deadlock.
+    pub fn wait_all_tasks(&self) -> Result<()> {
         loop {
-            let total_load: u64 = self
+            if self
                 .worker_handles
                 .iter()
-                .map(|w| w.stats.total_task_cost.load(Ordering::SeqCst))
-                .sum(); // TODO: race condition here
-
-            // block for all worker load to drain to zero
-            if total_load == 0 {
-                break;
+                .all(|w| w.stats.total_task_cost.load(Ordering::Relaxed) == 0)
+            {
+                return Ok(());
             }
 
-            std::thread::yield_now(); // TODO: busy-wait here
+            // blocks (spin -> yield -> park) until a worker reports idle
+            // pool holds idle_tx, that's mean this will error only if pool is dropped (likely case)
+            if let Ok(_signal) = self.idle_rx.recv() {
+                // got signal here, recheck all worker again
+            } else {
+                return Err(anyhow!(
+                    "failed to recv idle signal, possible reasons: worker thread panicked or dropped before sending the signal"
+                ));
+            }
         }
     }
 
@@ -217,6 +236,8 @@ impl WorkerPool {
     // TODO: pub fn reset_stats() {}
 
     /// Stops accepting `submit` calls, waits for all queued tasks to complete.
+    ///
+    /// > This `must not be called` from inside a task run by this pool, or it will hang forever.
     pub fn shutdown(&mut self) -> Result<()> {
         // drop all senders, workers will exit when their queues drain
         self.worker_handles.clear();

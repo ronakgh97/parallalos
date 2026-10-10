@@ -176,7 +176,40 @@ fn concurrent_submit_balances() {
     );
 }
 
-// Reference perf point for later refactors, not a correctness test
+#[test]
+fn wait_all_tasks_waits_for_queued_and_running() {
+    let p = WorkerPool::init_with(4).unwrap();
+
+    // more tasks than workers, and slow enough that some are still running
+    // when the last one is dequeued
+    for _ in 0..16 {
+        let _ = p.submit_with_cost(
+            || std::thread::sleep(Duration::from_millis(20)),
+            TaskCost::Low,
+        );
+    }
+
+    p.wait_all_tasks().unwrap();
+
+    let stats = p.stats();
+    assert!(
+        stats.iter().all(|w| w.tasks_cost == 0),
+        "pool not drained: {stats:?}"
+    );
+    assert_eq!(
+        stats.iter().map(|w| w.tasks_executed).sum::<u64>(),
+        16,
+        "wait_all_tasks returned before every task ran"
+    );
+}
+
+#[test]
+fn wait_all_tasks_returns_immediately_on_idle_pool() {
+    let p = WorkerPool::init_with(4).unwrap();
+    p.wait_all_tasks().unwrap();
+}
+
+// Reference perf point for later refactors, not a correctness test, RUN IN RELEASE MODE
 #[test]
 fn perf_regress_reference() {
     let p = WorkerPool::init_with(8).unwrap();
@@ -203,7 +236,7 @@ fn perf_regress_reference() {
         "workers stats after submitting {TASK_COUNT} tasks: {:?}",
         p.stats()
     );
-    p.wait_all_tasks();
+    p.wait_all_tasks().unwrap();
     let elapsed = start.elapsed();
 
     let baseline = Duration::from_millis(110);

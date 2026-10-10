@@ -19,13 +19,16 @@ pub struct WorkerHandle {
 /// This spawn thread and run tasks until every `WorkerHandle` is dropped.
 /// According to `crossbeam docs`, this will return only if `all senders are dropped` AND `the channel is empty`,
 /// therefore this drains the channel even if schedular has drop tx_handles, and return on empty channel.
-pub fn init_worker(id: usize) -> (WorkerHandle, JoinHandle<()>) {
+///
+/// Sends one tick on `idle_tx` after completing all task queued to it,
+/// so that the pool can wait for `all workers to be idle` and shutdown gracefully.
+pub fn init_worker(id: usize, idle_tx: Sender<()>) -> (WorkerHandle, JoinHandle<()>) {
     let (tx, rx) = crossbeam::channel::unbounded::<Task>();
     let stats = Arc::new(WorkerStats {
         total_task_cost: AtomicU64::new(0),
         total_task_executed: AtomicU64::new(0),
         total_task_exec_time: AtomicU64::new(0),
-        ewma_exec_time_per_task_cost: AtomicU64::new(64), // 0 would cause weird behavior on cold start worker
+        ewma_exec_time_per_task_cost: AtomicU64::new(32), // zero would cause weird behavior on cold start worker
     });
     let thread_stats = Arc::clone(&stats);
     let thread_handle = std::thread::spawn(move || {
@@ -35,16 +38,24 @@ pub fn init_worker(id: usize) -> (WorkerHandle, JoinHandle<()>) {
             // and return value to TaskHandle via oneshot channel
             (task.exec)(id);
             let elapsed = start.elapsed().as_nanos() as u64;
-            thread_stats
+            let cost = task.cost.to_value();
+            let drained = thread_stats
                 .total_task_cost
-                .fetch_sub(task.cost.to_value(), Ordering::Relaxed);
+                .fetch_sub(cost, Ordering::Relaxed)
+                == cost; // this becomes true after executing the last task in the queue
             thread_stats
                 .total_task_exec_time
                 .fetch_add(elapsed, Ordering::Relaxed);
             thread_stats
                 .total_task_executed
                 .fetch_add(1, Ordering::Relaxed);
-            thread_stats.update_ewa(elapsed, task.cost.to_value());
+            thread_stats.update_ewa(elapsed, cost);
+
+            // signal the pool that this worker has drained
+            // its queue and is idle at this instant
+            if drained {
+                let _ = idle_tx.send(());
+            }
         }
     });
     (WorkerHandle { id, tx, stats }, thread_handle)

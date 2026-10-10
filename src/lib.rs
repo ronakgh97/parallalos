@@ -1,3 +1,4 @@
+// use crate::pool::WorkerPool;
 use crate::tasks::TaskCost;
 
 pub mod pool;
@@ -11,6 +12,11 @@ pub(crate) struct Task {
     /// Closure that capture callable and worker id that's executing it
     pub exec: Box<dyn FnOnce(usize) + Send + 'static>,
 }
+
+// pub(crate) static GLOBAL_WORKER_POOL: std::sync::LazyLock<WorkerPool> =
+//     std::sync::LazyLock::new(|| {
+//         WorkerPool::init().expect("failed to initialize global worker pool")
+//     });
 
 #[test]
 fn lib_test() {

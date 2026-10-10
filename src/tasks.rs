@@ -66,7 +66,9 @@ impl<T> TaskHandle<T> {
             Ok(TaskResult::Success(s, id)) => Ok((s, id)),
             Ok(TaskResult::Panic(e)) => std::panic::resume_unwind(e),
             // sender has been dropped, worker thread has panicked or exited
-            Err(e) => Err(anyhow!("worker failed to send task result: {e}")),
+            Err(_) => Err(anyhow!(
+                "failed to recv task result, possible reasons: worker thread panicked or dropped before sending the result"
+            )),
         }
     }
 }
