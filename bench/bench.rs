@@ -18,12 +18,12 @@ static SHARED_PAYLOAD: LazyLock<Box<[u8]>> = LazyLock::new(|| {
     for _ in 0..(1 << 20) {
         p.extend_from_slice(
             format!(
-                "user=u{:05} action=login ip=10.{}.{}.{} code={:?}\n",
+                "user=u{:05} action=login ip=10.{}.{}.{} code={}\n",
                 fastrand::u64(..100_000),
                 fastrand::u8(..255),
                 fastrand::u8(..255),
                 fastrand::u8(..255),
-                fastrand::choice(["200", "201", "202", "400", "401", "403", "500"])
+                fastrand::u64(400..429)
             )
             .as_bytes(),
         );
@@ -69,49 +69,50 @@ impl TaskKind {
 }
 
 const WORKERS: usize = 16; // I have intel i7-14650hx, 24 Cores
-const BATCH: usize = 4096;
+const TASKS: usize = 4096;
 
 fn main() -> Result<()> {
-    let wp = WorkerPool::init_with(WORKERS)?;
+    // TODO: I don't need warmup
+    let pool = WorkerPool::init_with(WORKERS)?;
+    let mut task_handles = Vec::with_capacity(TASKS);
     println!(
-        "{WORKERS} workers, {BATCH} tasks, payload {} MB\n",
+        "running {TASKS} tasks with {WORKERS} workers (payload {} MB)\n",
         SHARED_PAYLOAD.len() / (1 << 20)
     );
 
-    // TODO; Add warmup
     let start = Instant::now();
-    let mut handles = Vec::with_capacity(BATCH);
-    for _ in 0..BATCH {
+    for _ in 0..TASKS {
         let task = TaskKind::ALL[fastrand::usize(..TaskKind::ALL.len())];
-        handles.push(wp.submit_with_cost(move || task.run(), task.cost())?);
+        task_handles.push(pool.submit_with_cost(move || task.run(), task.cost())?);
     }
-    for h in handles {
+    for h in task_handles {
         h.wait()?;
     }
     let makespan = start.elapsed().as_secs_f64();
 
-    let worker_states = wp.stats();
+    let worker_states = pool.stats();
     let total_worker_busy_time =
         worker_states.iter().map(|w| w.tasks_exec_time).sum::<u64>() as f64;
 
     println!(
         "{:>5} {:>7} {:>11} {:>8}",
-        "worker", "tasks", "busy(s)", "utils%"
+        "worker", "tasks", "busy", "util"
     );
-    println!("{}", "-".repeat(32));
+    println!("{}", "-".repeat(36));
     for (i, w) in worker_states.iter().enumerate() {
         println!(
-            "{:>5} {:>7} {:>11.3} {:>8.3}%",
+            "{:>5} {:>7} {:>11.2}s {:>8.2}%",
             i,
             w.tasks_executed,
             w.tasks_exec_time as f64 / 1_000_000_000.0,
             w.tasks_exec_time as f64 / (makespan * 1_000_000_000.0) * 100.0,
         );
     }
-    println!("{}", "-".repeat(32));
+    println!("{}", "-".repeat(36));
     println!(
-        "makespan: {:.3} sec\ntotal busy: {:.3} sec\ntotal utils: {:.2}%",
+        "achieved makespan: {:.3} sec\nideal makespan: {:.3} sec\ntotal busy: {:.3} sec\ntotal util: {:.2}%",
         makespan,
+        total_worker_busy_time / 1_000_000_000.0 / WORKERS as f64,
         total_worker_busy_time / 1_000_000_000.0,
         total_worker_busy_time / (makespan * WORKERS as f64 * 1_000_000_000.0) * 100.0
     );
