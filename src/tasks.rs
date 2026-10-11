@@ -26,10 +26,14 @@ pub struct TaskHandle<T> {
 
 // TODO:
 /// The approximate cost of a task, helps the scheduler to `balance the load` and
-/// fairly schedule it, such that `tasks with different workload can together process faster`, and the pool can `maximize throughput`
+/// fairly schedule it, such that `tasks with different workload can together process faster`,
+/// and the pool can `maximize throughput`
 ///
 /// To put simply, cost adds weight to `predicted completion time` of workers,
-/// so that the scheduler can `avoid overloading` a worker with `high cost tasks` and `fairly distribute` the workload across all workers
+/// so that the scheduler can `avoid overloading` workers with high cost tasks or `avoid blocking` low cost tasks on long busy worker,
+/// and `uniformly distribute` the workload across all workers. This is called `Uniform-Machine scheduling`.
+///
+/// More details on this [wiki pages](https://en.wikipedia.org/wiki/Uniform-machines_scheduling)
 ///
 /// > This will be removed or changed in the future for more improved scheduling and better workload distribution
 pub enum TaskCost {

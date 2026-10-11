@@ -23,8 +23,8 @@ macro_rules! exec_task {
 
 /// A pool of worker threads that can schedule/execute tasks concurrently
 pub struct WorkerPool {
-    worker_handles: Vec<WorkerHandle>,
-    worker_threads: Vec<JoinHandle<()>>,
+    pub(crate) worker_handles: Vec<WorkerHandle>,
+    pub(crate) worker_threads: Vec<JoinHandle<()>>,
     // this is needed for keeping channel alive, throughout the lifetime of the pool
     #[allow(unused)]
     idle_tx: crossbeam::channel::Sender<()>,
@@ -75,87 +75,17 @@ impl WorkerPool {
         })
     }
 
-    /// Returns the index of worker for assigning the task.
-    #[inline(always)]
-    fn schedule_worker(&self) -> Option<usize> {
-        let n = self.worker_handles.len();
-        if n == 0 {
-            return None;
-        }
-
-        // rand sample two distinct workers and pick the one
-        // with the lesser `total_tasks_cost (queued/running) * ewma_execution_time_per_task_cost`
-        // i.e. find the worker that is predicted to complete it task faster
-        let a = fastrand::usize(..n);
-        let b = {
-            let b = fastrand::usize(..n - 1);
-            if b >= a { b + 1 } else { b }
-        };
-
-        // the rank is a predicted time (in nanos) to drain this worker task queue
-        let (wa, wb) = (&self.worker_handles[a], &self.worker_handles[b]);
-        let rank_a = wa
-            .stats
-            .total_task_cost
-            .load(Ordering::Relaxed)
-            .saturating_mul(
-                wa.stats
-                    .ewma_exec_time_per_task_cost
-                    .load(Ordering::Relaxed),
-            );
-
-        let rank_b = wb
-            .stats
-            .total_task_cost
-            .load(Ordering::Relaxed)
-            .saturating_mul(
-                wb.stats
-                    .ewma_exec_time_per_task_cost
-                    .load(Ordering::Relaxed),
-            );
-
-        if rank_a > rank_b {
-            Some(b)
-        } else if rank_a < rank_b {
-            Some(a)
-        } else {
-            let coin_flip = fastrand::bool(); // 50/50 on tie
-            if coin_flip { Some(a) } else { Some(b) }
-        }
-    }
-
     // TODO: fn add_worker()
 
     // TODO: fn remove_worker()
 
-    /// Submits a task to the pool with `TaskCost::Normal` and returns a handle to await its result.
-    ///
-    /// Use `submit_with_cost` if you want to specify a different cost for the task.
-    pub fn submit<F, T>(&self, f: F) -> Result<TaskHandle<T>>
+    #[inline(always)]
+    fn submit_to_worker<F, T>(&self, index: usize, task: F, cost: TaskCost) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        self.submit_with_cost(f, TaskCost::Normal)
-    }
-
-    // TODO: fn submit_batch()
-
-    /// Submits a task to the pool with an `TaskCost`,
-    /// i.e. how heavy the task is expected to be, in range of `Low` to `VeryHigh`
-    /// and returns a handle for awaiting its result or errors if Pool is shut down.
-    ///
-    /// > TaskCost directly affects the behavior of the scheduler and may change or be removed in the future
-    pub fn submit_with_cost<F, T>(&self, f: F, cost: TaskCost) -> Result<TaskHandle<T>>
-    where
-        F: FnOnce() -> T + Send + 'static,
-        T: Send + 'static,
-    {
-        let index = self
-            .schedule_worker()
-            .ok_or_else(|| anyhow!("worker pool has been shut down"))?;
         let cost_value = cost.to_value();
-
         let worker_tx_handle = &self.worker_handles[index];
         worker_tx_handle
             .stats
@@ -165,7 +95,7 @@ impl WorkerPool {
         let (rtx, rrx) = crossbeam::channel::bounded(1);
         let task = Task {
             cost,
-            exec: exec_task!(f, rtx),
+            exec: exec_task!(task, rtx),
         };
 
         // send the task to selected worker queue
@@ -182,14 +112,140 @@ impl WorkerPool {
         Ok(TaskHandle { rx: rrx })
     }
 
+    // TODO: Nested parallelism does not work as of now
+
+    /// Submits a task to the pool with `TaskCost::Normal` and returns a handle to await its result.
+    ///
+    /// Use `submit_with` for specifying a different cost and more details.
+    pub fn submit<F, T>(&self, task: F) -> Result<TaskHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with(task, TaskCost::Normal)
+    }
+
+    /// Submits a task to the pool with an `TaskCost`,
+    /// i.e. how heavy the task is expected to be, in range of `Low` to `VeryHigh`
+    /// and returns a handle for awaiting its result or errors if Pool is shut down.
+    ///
+    /// This uses `List Scheduling` with `Online Approximation` (Power of Two Choices instead of full scan)
+    /// and `Uniform "Machine" Scheduling` to select a worker thread for executing the task.
+    /// Uniform Scheduling means there scheduler accounts for the `predicted completion time` of each worker.
+    /// This may `increase makespan`, but `minimizes the total busy time` of workers in most cases.
+    ///
+    /// > TaskCost directly affects the behavior of the scheduler and may change or be removed in the future
+    pub fn submit_with<F, T>(&self, task: F, cost: TaskCost) -> Result<TaskHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let index = {
+            let n = self.worker_handles.len();
+            if n == 0 {
+                return Err(anyhow!("worker pool has been shut down"));
+            }
+
+            // online approximation here; 0(1) instead of 0(n) scan
+            // rand sample two distinct workers and pick the one
+            // with the lesser `total_tasks_cost (queued/running) * ewma_execution_time_per_task_cost`
+            // i.e. find the worker that is predicted to complete it task faster
+            let a = fastrand::usize(..n);
+            let b = {
+                let b = fastrand::usize(..n - 1);
+                if b >= a { b + 1 } else { b }
+            };
+
+            // uniform machine scheduling here; basically, select worker to optimize makespan
+            // the rank is a predicted time (in nanos) to drain this worker task queue
+            let (wa, wb) = (&self.worker_handles[a], &self.worker_handles[b]);
+            let rank_a = wa
+                .stats
+                .total_task_cost
+                .load(Ordering::Relaxed)
+                .saturating_mul(
+                    wa.stats
+                        .ewma_exec_time_per_task_cost
+                        .load(Ordering::Relaxed),
+                );
+
+            let rank_b = wb
+                .stats
+                .total_task_cost
+                .load(Ordering::Relaxed)
+                .saturating_mul(
+                    wb.stats
+                        .ewma_exec_time_per_task_cost
+                        .load(Ordering::Relaxed),
+                );
+
+            if rank_a > rank_b {
+                b
+            } else if rank_a < rank_b {
+                a
+            } else {
+                let coin_flip = fastrand::bool(); // 50/50 on tie
+                if coin_flip { a } else { b }
+            }
+        };
+
+        self.submit_to_worker(index, task, cost)
+    }
+
+    /// Submits a batch of tasks to the pool with their respective `TaskCost`,
+    /// and return the handles for awaiting their results or errors if Pool is shut down.
+    ///
+    /// This uses `Longest Processing Time (LPT)` scheduling, the `Identical "Machines" Scheduling` heuristic.
+    /// Identical Scheduling means the scheduler care only task placement, regardless of the speed variance of workers threads.
+    /// This aims to `optimize the makespan`, giving long tasks more room to complete faster,
+    /// followed by shorter tasks, but `maximizing the total busy time` of workers.
+    ///
+    pub fn submit_batch<I, F, T>(&self, tasks: I) -> Result<Vec<TaskHandle<T>>>
+    where
+        I: Iterator<Item = (F, TaskCost)>,
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        // sort descending by cost, LPT scheduling heuristic
+        let mut tasks: Vec<_> = tasks.collect();
+        tasks.sort_by_key(|(_, cost)| std::cmp::Reverse(cost.to_value()));
+
+        // load all workers instant state
+        let mut workers_load: Vec<u64> = self
+            .worker_handles
+            .iter()
+            .map(|w| w.stats.total_task_cost.load(Ordering::Relaxed))
+            .collect();
+
+        // submit each task to the least loaded worker, and update the load of that worker
+        let mut handles = Vec::with_capacity(tasks.len());
+        // TODO: consider perf overhead here
+        for (func, cost) in tasks {
+            // TODO; consider EWMA calculation here for uniform scheduling
+            let cost_value = cost.to_value();
+            let Some(index) = workers_load
+                .iter()
+                .enumerate()
+                .min_by_key(|&(_, &load)| load) // find the least loaded worker
+                .map(|(index, _)| index)
+            else {
+                return Err(anyhow!("worker pool has been shut down mid-batch"));
+            };
+
+            handles.push(self.submit_to_worker(index, func, cost)?);
+            workers_load[index] += cost_value; // update the load of the selected worker
+        }
+        Ok(handles)
+    }
+
     /// Blocks until the pool has `no queued tasks`, i.e. every worker has
     /// drained its queue and finished whatever it was running.
     ///
-    /// Tasks submitted by `other threads during this call` may also be waited
+    /// Tasks that are submitted by `other threads during this call` may also be waited
     /// on, since the pool simply has to be idle. It does not prevent `submit`.
     ///
     /// > This `must not be called` from inside a task run by this pool, or it will deadlock.
-    pub fn wait_all_tasks(&self) -> Result<()> {
+    pub fn wait_all(&self) -> Result<()> {
         loop {
             if self
                 .worker_handles

@@ -40,7 +40,7 @@ fn loads_balance_after_all_tasks_complete() {
                 3 => TaskCost::High,
                 _ => TaskCost::VeryHigh,
             };
-            p.submit_with_cost(move || i * i, c).unwrap()
+            p.submit_with(move || i * i, c).unwrap()
         })
         .collect();
 
@@ -67,7 +67,7 @@ fn fire_and_forget_tasks_still_balance() {
             3 => TaskCost::High,
             _ => TaskCost::VeryHigh,
         };
-        let _ = p.submit_with_cost(move || i, c);
+        let _ = p.submit_with(move || i, c);
     }
     assert_balanced(&p);
 }
@@ -75,11 +75,11 @@ fn fire_and_forget_tasks_still_balance() {
 #[test]
 fn low_cost_tasks_count_toward_load() {
     let p = WorkerPool::init_with(2).unwrap();
-    p.submit_with_cost(|| 1u64, TaskCost::Low)
+    p.submit_with(|| 1u64, TaskCost::Low)
         .unwrap()
         .wait()
         .unwrap();
-    p.submit_with_cost(|| 2u64, TaskCost::Low)
+    p.submit_with(|| 2u64, TaskCost::Low)
         .unwrap()
         .wait()
         .unwrap();
@@ -177,19 +177,90 @@ fn concurrent_submit_balances() {
 }
 
 #[test]
+fn batch_spreads_work_across_all_workers() {
+    const WORKERS: usize = 8;
+    const TASKS: usize = 512;
+
+    let p = WorkerPool::init_with(WORKERS).unwrap();
+
+    // alternate Low/High so the LPT sort has real ordering work to do
+    let tasks = (0..TASKS).map(|i| {
+        let cost = if i % 2 == 0 {
+            TaskCost::Low
+        } else {
+            TaskCost::High
+        };
+        (move || black_box(i), cost)
+    });
+
+    let handles = p.submit_batch(tasks).unwrap();
+    assert_eq!(handles.len(), TASKS, "batch dropped task handles");
+
+    for handle in handles {
+        let _ = handle.wait().unwrap();
+    }
+
+    let executed: Vec<u64> = p.stats().iter().map(|w| w.tasks_executed).collect();
+    assert!(
+        executed.iter().all(|&n| n == TASKS as u64 / WORKERS as u64),
+        "LPT should spread the batch evenly, got {executed:?}"
+    );
+
+    assert_balanced(&p);
+}
+
+#[test]
+fn batch_with_uniform_costs_spreads_evenly() {
+    const WORKERS: usize = 8;
+    const TASKS: usize = 256;
+
+    let p = WorkerPool::init_with(WORKERS).unwrap();
+
+    let tasks = (0..TASKS).map(|i| (move || black_box(i), TaskCost::Normal));
+    let handles = p.submit_batch(tasks).unwrap();
+    assert_eq!(handles.len(), TASKS, "batch dropped task handles");
+
+    for handle in handles {
+        let _ = handle.wait().unwrap();
+    }
+
+    let executed: Vec<u64> = p.stats().iter().map(|w| w.tasks_executed).collect();
+    assert!(
+        executed.iter().all(|&n| n > 0),
+        "some worker got no work at all: {executed:?}"
+    );
+    assert!(
+        executed.iter().all(|&n| n == TASKS as u64 / WORKERS as u64),
+        "uniform-cost batch should round-robin evenly, got {executed:?}"
+    );
+
+    assert_balanced(&p);
+}
+
+#[test]
+fn batch_refused_after_shutdown() {
+    let mut p = WorkerPool::init_with(4).unwrap();
+    p.shutdown().unwrap();
+
+    let result = p.submit_batch((0..8).map(|i| (move || black_box(i), TaskCost::Normal)));
+
+    assert!(result.is_err(), "batch should refuse on a shut down pool");
+}
+
+#[test]
 fn wait_all_tasks_waits_for_queued_and_running() {
     let p = WorkerPool::init_with(4).unwrap();
 
     // more tasks than workers, and slow enough that some are still running
     // when the last one is dequeued
     for _ in 0..16 {
-        let _ = p.submit_with_cost(
+        let _ = p.submit_with(
             || std::thread::sleep(Duration::from_millis(20)),
             TaskCost::Low,
         );
     }
 
-    p.wait_all_tasks().unwrap();
+    p.wait_all().unwrap();
 
     let stats = p.stats();
     assert!(
@@ -206,12 +277,12 @@ fn wait_all_tasks_waits_for_queued_and_running() {
 #[test]
 fn wait_all_tasks_returns_immediately_on_idle_pool() {
     let p = WorkerPool::init_with(4).unwrap();
-    p.wait_all_tasks().unwrap();
+    p.wait_all().unwrap();
 }
 
 // Reference perf point for later refactors, not a correctness test, RUN IN RELEASE MODE
 #[test]
-fn perf_regress_reference() {
+fn perf_regress_reference_single() {
     let p = WorkerPool::init_with(8).unwrap();
 
     const TASK_COUNT: usize = 178956; // MAGIC NUMBER, DO NOT CHANGE!!!
@@ -219,13 +290,13 @@ fn perf_regress_reference() {
     let start = Instant::now();
     for _ in 0..TASK_COUNT {
         if fastrand::bool() {
-            p.submit_with_cost(
+            p.submit_with(
                 || black_box(sha2::Sha256::digest(b"hash payload-123ABC@#&".as_slice())),
                 TaskCost::High,
             )
             .unwrap();
         } else {
-            p.submit_with_cost(
+            p.submit_with(
                 || black_box(hex::encode(b"hex payload-123ABC@#&".as_slice())),
                 TaskCost::Low,
             )
@@ -236,13 +307,55 @@ fn perf_regress_reference() {
         "workers stats after submitting {TASK_COUNT} tasks: {:?}",
         p.stats()
     );
-    p.wait_all_tasks().unwrap();
+    p.wait_all().unwrap();
     let elapsed = start.elapsed();
 
     let baseline = Duration::from_millis(110);
     assert!(
         elapsed < baseline,
         "perf regression: took {:?} to complete {TASK_COUNT} tasks",
+        elapsed
+    );
+}
+
+#[test]
+fn perf_regress_reference_batch() {
+    let p = WorkerPool::init_with(8).unwrap();
+
+    const TASK_COUNT: usize = 178956;
+
+    let tasks = (0..TASK_COUNT).map(|_| {
+        let is_heavy = fastrand::bool();
+        let cost = if is_heavy {
+            TaskCost::High
+        } else {
+            TaskCost::Low
+        };
+
+        (
+            move || {
+                if is_heavy {
+                    black_box(sha2::Sha256::digest(b"hash payload-123ABC@#&".as_slice()));
+                } else {
+                    black_box(hex::encode(b"hex payload-123ABC@#&".as_slice()));
+                }
+            },
+            cost,
+        )
+    });
+
+    let start = Instant::now();
+    drop(p.submit_batch(tasks).unwrap());
+    println!(
+        "workers stats after submitting {TASK_COUNT} tasks in one batch: {:?}",
+        p.stats()
+    );
+    p.wait_all().unwrap();
+    let elapsed = start.elapsed();
+
+    assert!(
+        elapsed < Duration::from_millis(150),
+        "perf regression: took {:?} to complete {TASK_COUNT} tasks in one batch",
         elapsed
     );
 }

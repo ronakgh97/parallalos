@@ -83,7 +83,7 @@ fn main() -> Result<()> {
     let start = Instant::now();
     for _ in 0..TASKS {
         let task = TaskKind::ALL[fastrand::usize(..TaskKind::ALL.len())];
-        task_handles.push(pool.submit_with_cost(move || task.run(), task.cost())?);
+        task_handles.push(pool.submit_with(move || task.run(), task.cost())?);
     }
     for h in task_handles {
         h.wait()?;
