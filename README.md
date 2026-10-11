@@ -6,6 +6,8 @@ this [wiki page](https://en.wikipedia.org/wiki/Category:Scheduling_algorithms)
 Currently, the scheduler more or less implements `list scheduling` algorithm with `longest-processing-time-first` (LPT)
 heuristic.
 
+> Nested parallelism is not implemented, anything weird can lead to deadlocks.
+
 References:
 
 - https://en.wikipedia.org/wiki/List_scheduling

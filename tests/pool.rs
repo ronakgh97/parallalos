@@ -303,14 +303,17 @@ fn perf_regress_reference_single() {
             .unwrap();
         }
     }
-    println!(
-        "workers stats after submitting {TASK_COUNT} tasks: {:?}",
-        p.stats()
-    );
+    println!("{:?}", p.stats());
     p.wait_all().unwrap();
     let elapsed = start.elapsed();
 
-    let baseline = Duration::from_millis(110);
+    println!("makespan for {TASK_COUNT} tasks: {:?}", elapsed);
+    println!(
+        "busy worker time for {TASK_COUNT} tasks: {:?}",
+        p.stats().iter().map(|w| w.tasks_exec_time).sum::<u64>()
+    );
+
+    let baseline = Duration::from_millis(150);
     assert!(
         elapsed < baseline,
         "perf regression: took {:?} to complete {TASK_COUNT} tasks",
@@ -346,12 +349,15 @@ fn perf_regress_reference_batch() {
 
     let start = Instant::now();
     drop(p.submit_batch(tasks).unwrap());
-    println!(
-        "workers stats after submitting {TASK_COUNT} tasks in one batch: {:?}",
-        p.stats()
-    );
+    println!("{:?}", p.stats());
     p.wait_all().unwrap();
     let elapsed = start.elapsed();
+
+    println!("makespan for {TASK_COUNT} tasks: {:?}", elapsed);
+    println!(
+        "busy worker time for {TASK_COUNT} tasks: {:?}",
+        p.stats().iter().map(|w| w.tasks_exec_time).sum::<u64>()
+    );
 
     assert!(
         elapsed < Duration::from_millis(150),

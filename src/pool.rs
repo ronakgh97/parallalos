@@ -80,7 +80,12 @@ impl WorkerPool {
     // TODO: fn remove_worker()
 
     #[inline(always)]
-    fn submit_to_worker<F, T>(&self, index: usize, task: F, cost: TaskCost) -> Result<TaskHandle<T>>
+    pub(crate) fn submit_to_worker<F, T>(
+        &self,
+        index: usize,
+        task: F,
+        cost: TaskCost,
+    ) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,

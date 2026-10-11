@@ -1,5 +1,6 @@
 use crate::pool::WorkerPool;
 use crate::tasks::TaskCost;
+use std::sync::atomic::Ordering;
 
 pub mod pool;
 pub mod tasks;
@@ -18,21 +19,73 @@ pub(crate) static GLOBAL_WORKER_POOL: std::sync::LazyLock<WorkerPool> =
         WorkerPool::init().expect("failed to initialize global worker pool")
     });
 
+/// Initializes the global worker pool.
 pub fn init_global_pool() {
-    let _ = &*GLOBAL_WORKER_POOL;
+    let _ = &GLOBAL_WORKER_POOL;
 }
 
-// pub fn parallelize<I, F, T>(tasks: I) -> anyhow::Result<()>
-// where
-//     I: Iterator<Item = F>,
-//     F: FnOnce() -> T + Send + 'static,
-//     T: Send + 'static,
-// {
-//     Ok(())
-// }
+/// Returns a reference to the global worker pool.
+pub fn get_global_pool() -> &'static WorkerPool {
+    init_global_pool();
+    &GLOBAL_WORKER_POOL
+}
+
+/// Executes two tasks in parallel, blocks and returning their results.
+pub fn parallelize<A, B, RA, RB>(
+    task_a: A,
+    cost_a: TaskCost,
+    task_b: B,
+    cost_b: TaskCost,
+) -> anyhow::Result<(RA, RB)>
+where
+    A: FnOnce() -> RA + Send + 'static,
+    B: FnOnce() -> RB + Send + 'static,
+    RA: Send + 'static,
+    RB: Send + 'static,
+{
+    let pool = get_global_pool();
+    let cost_a_value = cost_a.to_value();
+    let cost_b_value = cost_b.to_value();
+
+    let first = pool
+        .worker_handles
+        .iter()
+        .min_by_key(|w| w.stats.total_task_cost.load(Ordering::Relaxed))
+        .ok_or(anyhow::anyhow!("global_pool is not initialized"))?; // should never happen, since pool can't be dropped
+
+    let second = pool
+        .worker_handles
+        .iter()
+        .filter(|w| w.id != first.id) // pool always have at least 2 workers, since
+        .min_by_key(|w| w.stats.total_task_cost.load(Ordering::Relaxed))
+        .ok_or(anyhow::anyhow!("global_pool is not initialized"))?;
+
+    // assign costly task to least loaded worker
+    if cost_a_value < cost_b_value {
+        let hb = pool.submit_to_worker(first.id, task_b, cost_b)?;
+        let ha = pool.submit_to_worker(second.id, task_a, cost_a)?;
+        Ok((ha.wait()?.0, hb.wait()?.0))
+    } else if cost_a_value > cost_b_value {
+        let ha = pool.submit_to_worker(first.id, task_a, cost_a)?;
+        let hb = pool.submit_to_worker(second.id, task_b, cost_b)?;
+        Ok((ha.wait()?.0, hb.wait()?.0))
+    } else {
+        let coin_flip = fastrand::bool();
+        if coin_flip {
+            let ha = pool.submit_to_worker(first.id, task_a, cost_a)?;
+            let hb = pool.submit_to_worker(second.id, task_b, cost_b)?;
+            Ok((ha.wait()?.0, hb.wait()?.0))
+        } else {
+            let hb = pool.submit_to_worker(first.id, task_b, cost_b)?;
+            let ha = pool.submit_to_worker(second.id, task_a, cost_a)?;
+            Ok((ha.wait()?.0, hb.wait()?.0))
+        }
+    }
+}
 
 #[test]
 fn lib_test() {
+    init_global_pool();
     let pool = WorkerPool::init_with(4).unwrap();
     let counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
 
@@ -40,7 +93,7 @@ fn lib_test() {
         .map(|_| {
             let counter_clone = std::sync::Arc::clone(&counter);
             pool.submit(move || {
-                counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                counter_clone.fetch_add(1, Ordering::SeqCst);
             })
         })
         .collect();
@@ -48,8 +101,22 @@ fn lib_test() {
     for handle in task_handles {
         let _ = handle.unwrap().wait();
     }
-
     // pool.wait_all_tasks();
 
-    assert_eq!(counter.load(std::sync::atomic::Ordering::SeqCst), 100);
+    assert_eq!(counter.load(Ordering::SeqCst), 100);
+
+    let time_taken = std::time::Instant::now();
+    parallelize(
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        },
+        TaskCost::Normal,
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        },
+        TaskCost::Normal,
+    )
+    .unwrap();
+    let elapsed = time_taken.elapsed();
+    assert!(elapsed < std::time::Duration::from_millis(225));
 }

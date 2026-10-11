@@ -46,10 +46,10 @@ pub fn init_worker(id: usize, idle_tx: Sender<()>) -> (WorkerHandle, JoinHandle<
             thread_stats
                 .total_task_exec_time
                 .fetch_add(elapsed, Ordering::Relaxed);
+            thread_stats.update_ewa(elapsed, cost);
             thread_stats
                 .total_task_executed
                 .fetch_add(1, Ordering::Relaxed);
-            thread_stats.update_ewa(elapsed, cost);
 
             // signal the pool that this worker has drained
             // its queue and is idle at this instant
