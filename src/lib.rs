@@ -1,3 +1,30 @@
+//! # Parallelos
+//!
+//! An experimental task scheduler for parallel workloads. Submit independent tasks,
+//! let the pool distribute the work, and collect their results when needed.
+//!
+//! Use [`WorkerPool`] to manage your own pool, or [`parallelize`]
+//! to run two tasks using the shared global pool. For workloads with varying task
+//! sizes, [`TaskCost`] lets you express their relative cost.
+//!
+//! ## Example
+//!
+//! ```
+//! use parallelos::pool::WorkerPool;
+//!
+//! let pool = WorkerPool::init_with(4)?;
+//! let a = pool.submit(|| (1..=10u64).sum::<u64>())?;
+//! let b = pool.submit(|| (1..=10u64).product::<u64>())?;
+//!
+//! let (sum, _) = a.wait()?;
+//! let (product, _) = b.wait()?;
+//! assert_eq!((sum, product), (55, 3_628_800));
+//! # Ok::<(), anyhow::Error>(())
+//! ```
+//!
+//! **Experimental:** the API and scheduling behavior may change. Nested parallelism
+//! is not supported; waiting on work in the same pool from within a task can deadlock.
+
 use crate::pool::WorkerPool;
 use crate::tasks::TaskCost;
 use std::sync::atomic::Ordering;
