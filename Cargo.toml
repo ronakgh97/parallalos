@@ -1,6 +1,6 @@
 [package]
 name = "parallelos"
-version = "1.2.0"
+version = "1.2.1"
 edition = "2024"
 authors = ["ronakgh {ronakgh97@gmail.com}"]
 description = "Thread pool for highly parallel computation"
@@ -23,8 +23,10 @@ harness = false
 crossbeam = "0.8.5"
 fastrand = "2.5.0"
 anyhow = "1.0.104"
+portable-atomic = { version = "1.15.0", features = ["float"] }
 
 [dev-dependencies]
+indicatif = "0.18.6"
 sha2 = "0.11.1"
 hex = "0.4.3"
 aes-gcm = "0.11.1"

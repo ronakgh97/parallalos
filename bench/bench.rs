@@ -15,14 +15,15 @@ static SHARED_AES_KEY: LazyLock<aes_gcm::Aes256Gcm> = LazyLock::new(|| {
 
 static SHARED_PAYLOAD: LazyLock<Box<[u8]>> = LazyLock::new(|| {
     let mut p = vec![];
-    for _ in 0..(1 << 20) {
+    for _ in 0..443665 {
         p.extend_from_slice(
             format!(
-                "user=u{:05} action=login ip=10.{}.{}.{} code={}\n",
+                "user=u{:05} action=login ip=10.{}.{}.{} port={} status_code={}\n",
                 fastrand::u64(..100_000),
                 fastrand::u8(..255),
                 fastrand::u8(..255),
                 fastrand::u8(..255),
+                fastrand::u16(..65535),
                 fastrand::u64(400..429)
             )
             .as_bytes(),
@@ -69,31 +70,69 @@ impl TaskKind {
 }
 
 const WORKERS: usize = 16; // I have intel i7-14650hx, 24 Cores
-const TASKS: usize = 4096;
+const TASKS: usize = 4128;
+const WARMUP_TASKS: usize = 2028;
 
 fn main() -> Result<()> {
-    // TODO: I don't need warmup
+    use indicatif::{ProgressBar, ProgressStyle};
+    {
+        let pb_task = ProgressBar::new(WARMUP_TASKS as u64);
+        println!("warming up with {WARMUP_TASKS} tasks");
+        pb_task.set_style(ProgressStyle::with_template(
+            " {bar:40.cyan/blue} {pos:3}/{len:3} task",
+        )?);
+
+        let pool = WorkerPool::init_with(WORKERS + 2)?;
+        for _ in 0..WARMUP_TASKS {
+            let task = TaskKind::ALL[fastrand::usize(..TaskKind::ALL.len())];
+            pool.submit_with(move || task.run(), task.cost())?;
+        }
+
+        loop {
+            let total_task_submitted = pool.total_task_completed();
+            pb_task.set_position(total_task_submitted);
+            if total_task_submitted >= WARMUP_TASKS as u64 {
+                break;
+            }
+            // std::thread::yield_now();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        pb_task.finish_and_clear();
+        black_box(pool.wait_all()?);
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+
     let pool = WorkerPool::init_with(WORKERS)?;
+    let pb_task = ProgressBar::new(TASKS as u64);
     let mut task_handles = Vec::with_capacity(TASKS);
     println!(
         "running {TASKS} tasks with {WORKERS} workers (payload {} MB)\n",
         SHARED_PAYLOAD.len() / (1 << 20)
     );
+    pb_task.set_style(ProgressStyle::with_template(
+        " {bar:40.cyan/blue} {pos:3}/{len:3} task",
+    )?);
 
     let start = Instant::now();
     for _ in 0..TASKS {
         let task = TaskKind::ALL[fastrand::usize(..TaskKind::ALL.len())];
         task_handles.push(pool.submit_with(move || task.run(), task.cost())?);
     }
-    for h in task_handles {
-        h.wait()?;
+
+    loop {
+        let total_task_submitted = pool.total_task_completed();
+        pb_task.set_position(total_task_submitted);
+        if total_task_submitted >= TASKS as u64 {
+            break;
+        }
+        // std::thread::yield_now();
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
+    pb_task.finish_and_clear();
+    black_box(pool.wait_all()?);
+
     let makespan = start.elapsed().as_secs_f64();
-
-    let worker_states = pool.stats();
-    let total_worker_busy_time =
-        worker_states.iter().map(|w| w.tasks_exec_time).sum::<u64>() as f64;
-
+    let worker_states = pool.state();
     println!(
         "{:>5} {:>7} {:>11} {:>8}",
         "worker", "tasks", "busy", "util"
@@ -104,11 +143,13 @@ fn main() -> Result<()> {
             "{:>5} {:>7} {:>11.2}s {:>8.2}%",
             i,
             w.tasks_executed,
-            w.tasks_exec_time as f64 / 1_000_000_000.0,
-            w.tasks_exec_time as f64 / (makespan * 1_000_000_000.0) * 100.0,
+            w.tasks_exec_time / 1_000_000_000.0,
+            w.tasks_exec_time / (makespan * 1_000_000_000.0) * 100.0,
         );
     }
     println!("{}", "-".repeat(36));
+
+    let total_worker_busy_time = worker_states.iter().map(|w| w.tasks_exec_time).sum::<f64>();
     println!(
         "achieved makespan: {:.3} sec\nideal makespan: {:.3} sec\ntotal busy: {:.3} sec\ntotal util: {:.2}%",
         makespan,
