@@ -23,8 +23,8 @@ macro_rules! exec_task {
 
 /// A pool of worker threads that can schedule/execute tasks concurrently
 pub struct WorkerPool {
-    pub(crate) worker_handles: Vec<WorkerHandle>,
-    pub(crate) worker_threads: Vec<JoinHandle<()>>,
+    pub(crate) worker_handles: Box<[WorkerHandle]>,
+    pub(crate) worker_threads: Box<[JoinHandle<()>]>,
     // this is needed for keeping channel alive, throughout the lifetime of the pool
     #[allow(unused)]
     idle_tx: crossbeam::channel::Sender<()>,
@@ -38,9 +38,9 @@ pub struct WorkerState {
     pub tasks_cost: u64,
     pub tasks_queued: u64,
     pub tasks_executed: u64,
-    pub tasks_exec_time: u64,
-    pub ewa_exec_time_per_task: u64,
-    pub predicted_completion_time: u64,
+    pub tasks_exec_time: f64,
+    pub ewa_exec_time_per_task: f64,
+    pub predicted_completion_time: f64,
 }
 
 impl WorkerPool {
@@ -59,17 +59,18 @@ impl WorkerPool {
         // so that the pool shutdown can wake up when all workers are idle and close gracefully
         let (idle_tx, idle_rx) = crossbeam::channel::unbounded::<()>();
 
-        let (handles, threads) = (0..n)
-            .into_iter()
-            .map(|id| {
-                let (handle, thread) = init_worker(id, idle_tx.clone());
-                (handle, thread)
-            })
-            .collect();
+        let mut handles = Vec::with_capacity(n);
+        let mut threads = Vec::with_capacity(n);
+        (0..n)
+            .map(|id| init_worker(id, idle_tx.clone()))
+            .for_each(|(worker, thread)| {
+                handles.push(worker);
+                threads.push(thread);
+            });
 
         Ok(WorkerPool {
-            worker_handles: handles,
-            worker_threads: threads,
+            worker_handles: handles.into_boxed_slice(),
+            worker_threads: threads.into_boxed_slice(),
             idle_tx,
             idle_rx,
         })
@@ -164,25 +165,17 @@ impl WorkerPool {
             // uniform machine scheduling here; basically, select worker to optimize makespan
             // the rank is a predicted time (in nanos) to drain this worker task queue
             let (wa, wb) = (&self.worker_handles[a], &self.worker_handles[b]);
-            let rank_a = wa
-                .stats
-                .total_task_cost
-                .load(Ordering::Relaxed)
-                .saturating_mul(
-                    wa.stats
-                        .ewma_exec_time_per_task_cost
-                        .load(Ordering::Relaxed),
-                );
+            let rank_a = (wa.stats.total_task_cost.load(Ordering::Relaxed) as f64).algebraic_mul(
+                wa.stats
+                    .ewma_exec_time_per_task_cost
+                    .load(Ordering::Relaxed),
+            );
 
-            let rank_b = wb
-                .stats
-                .total_task_cost
-                .load(Ordering::Relaxed)
-                .saturating_mul(
-                    wb.stats
-                        .ewma_exec_time_per_task_cost
-                        .load(Ordering::Relaxed),
-                );
+            let rank_b = (wb.stats.total_task_cost.load(Ordering::Relaxed) as f64).algebraic_mul(
+                wb.stats
+                    .ewma_exec_time_per_task_cost
+                    .load(Ordering::Relaxed),
+            );
 
             if rank_a > rank_b {
                 b
@@ -200,8 +193,9 @@ impl WorkerPool {
     /// Submits a batch of tasks to the pool with their respective `TaskCost`,
     /// and return the handles for awaiting their results or errors if Pool is shut down.
     ///
-    /// This uses `Longest Processing Time (LPT)` scheduling, the `Identical "Machines" Scheduling` heuristic.
-    /// Identical Scheduling means the scheduler care only task placement, regardless of the speed variance of workers threads.
+    /// This uses `Longest Processing Time (LPT)` scheduling, the `Uniform "Machines" Scheduling` heuristic.
+    /// Uniform Scheduling means task is assigned to workers based on their completion time and overall workers state.
+    /// Identical Scheduling means the scheduler care only task placement, regardless of the speed variance of workers.
     /// This aims to `optimize the makespan`, giving long tasks more room to complete faster,
     /// followed by shorter tasks, but `maximizing the total busy time` of workers.
     ///
@@ -216,29 +210,32 @@ impl WorkerPool {
         tasks.sort_by_key(|(_, cost)| std::cmp::Reverse(cost.to_value()));
 
         // load all workers instant state
-        let mut workers_load: Vec<u64> = self
+        let mut workers_load: Vec<f64> = self
             .worker_handles
             .iter()
-            .map(|w| w.stats.total_task_cost.load(Ordering::Relaxed))
+            .map(|w| {
+                (w.stats.total_task_cost.load(Ordering::Relaxed) as f64)
+                    .algebraic_mul(w.stats.ewma_exec_time_per_task_cost.load(Ordering::Relaxed))
+            })
             .collect();
 
-        // submit each task to the least loaded worker, and update the load of that worker
+        // submit each task to the least loaded worker, and
+        // update the load of that worker for reconciling the next task placement
         let mut handles = Vec::with_capacity(tasks.len());
         // TODO: consider perf overhead here
         for (func, cost) in tasks {
-            // TODO; consider EWMA calculation here for uniform scheduling
             let cost_value = cost.to_value();
             let Some(index) = workers_load
                 .iter()
                 .enumerate()
-                .min_by_key(|&(_, &load)| load) // find the least loaded worker
+                .min_by(|(_, a), (_, b)| a.total_cmp(b)) // find the least "loaded" worker
                 .map(|(index, _)| index)
             else {
                 return Err(anyhow!("worker pool has been shut down mid-batch"));
             };
 
             handles.push(self.submit_to_worker(index, func, cost)?);
-            workers_load[index] += cost_value; // update the load of the selected worker
+            workers_load[index] += cost_value as f64; // update the load of the selected worker
         }
         Ok(handles)
     }
@@ -272,8 +269,24 @@ impl WorkerPool {
         }
     }
 
-    /// Returns the current state for all worker in the pool.
-    pub fn stats(&self) -> Vec<WorkerState> {
+    #[inline]
+    /// Returns the total number of tasks completed by all workers in the pool.
+    pub fn total_task_completed(&self) -> u64 {
+        self.worker_handles
+            .iter()
+            .map(|w| w.stats.total_task_executed.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    #[inline]
+    /// Returns the total number of tasks currently queued in all workers in the pool.
+    pub fn total_task_queued(&self) -> u64 {
+        self.worker_handles.iter().map(|w| w.tx.len() as u64).sum()
+    }
+
+    #[inline]
+    /// Returns the current state for all idle/running worker in the pool.
+    pub fn state(&self) -> Vec<WorkerState> {
         self.worker_handles
             .iter()
             .map(|w| WorkerState {
@@ -285,26 +298,28 @@ impl WorkerPool {
                     .stats
                     .ewma_exec_time_per_task_cost
                     .load(Ordering::Relaxed),
-                predicted_completion_time: w
-                    .stats
-                    .total_task_cost
-                    .load(Ordering::Relaxed)
-                    .saturating_mul(w.stats.ewma_exec_time_per_task_cost.load(Ordering::Relaxed)),
+                predicted_completion_time: (w.stats.total_task_cost.load(Ordering::Relaxed) as f64)
+                    .algebraic_mul(w.stats.ewma_exec_time_per_task_cost.load(Ordering::Relaxed)),
             })
             .collect()
     }
 
-    // TODO: pub fn reset_stats() {}
+    // TODO: pub fn reset_state() {}
 
     /// Stops accepting `submit` calls, waits for all queued tasks to complete.
     ///
     /// > This `must not be called` from inside a task run by this pool, or it will hang forever.
     pub fn shutdown(&mut self) -> Result<()> {
         // drop all senders, workers will exit when their queues drain
-        self.worker_handles.clear();
+        let worker_handles = std::mem::take(&mut self.worker_handles);
+        drop(worker_handles);
 
+        // take ownership of worker threads here
+        let worker_threads = std::mem::take(&mut self.worker_threads);
+
+        // join and check for panics
         let mut thread_panicked = 0u64;
-        for threads in self.worker_threads.drain(..) {
+        for threads in worker_threads {
             if threads.join().is_err() {
                 // eprintln!("worker thread panicked: {:?}", e);
                 thread_panicked += 1;

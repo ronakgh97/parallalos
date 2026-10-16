@@ -26,7 +26,7 @@
 //! is not supported; waiting on work in the same pool from within a task can deadlock.
 
 use crate::pool::WorkerPool;
-use crate::tasks::TaskCost;
+use crate::tasks::{TaskCost, TaskHandle};
 use std::sync::atomic::Ordering;
 
 pub mod pool;
@@ -108,6 +108,16 @@ where
             Ok((ha.wait()?.0, hb.wait()?.0))
         }
     }
+}
+
+/// Spawns a task with the given cost in the global worker pool.
+/// This is a convenience wrapper around `WorkerPool::submit_with` using the global pool.
+pub fn spawn<F: FnOnce() + Send + 'static>(
+    task: F,
+    cost: TaskCost,
+) -> anyhow::Result<TaskHandle<()>> {
+    let pool = get_global_pool();
+    pool.submit_with(task, cost)
 }
 
 #[test]

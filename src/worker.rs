@@ -1,5 +1,6 @@
 use crate::Task;
 use crossbeam::channel::Sender;
+use portable_atomic::AtomicF64;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
@@ -27,8 +28,8 @@ pub fn init_worker(id: usize, idle_tx: Sender<()>) -> (WorkerHandle, JoinHandle<
     let stats = Arc::new(WorkerStats {
         total_task_cost: AtomicU64::new(0),
         total_task_executed: AtomicU64::new(0),
-        total_task_exec_time: AtomicU64::new(0),
-        ewma_exec_time_per_task_cost: AtomicU64::new(32), // zero would cause weird behavior on cold start worker
+        total_task_exec_time: AtomicF64::new(0.0),
+        ewma_exec_time_per_task_cost: AtomicF64::new(22.5), // zero would cause weird behavior on cold start worker
     });
     let thread_stats = Arc::clone(&stats);
     let thread_handle = std::thread::spawn(move || {
@@ -37,7 +38,7 @@ pub fn init_worker(id: usize, idle_tx: Sender<()>) -> (WorkerHandle, JoinHandle<
             // execute the task, set id by the worker executing it
             // and return value to TaskHandle via oneshot channel
             (task.exec)(id);
-            let elapsed = start.elapsed().as_nanos() as u64;
+            let elapsed = start.elapsed().as_nanos() as f64;
             let cost = task.cost.to_value();
             let drained = thread_stats
                 .total_task_cost
@@ -65,21 +66,21 @@ pub fn init_worker(id: usize, idle_tx: Sender<()>) -> (WorkerHandle, JoinHandle<
 pub struct WorkerStats {
     pub total_task_cost: AtomicU64,
     pub total_task_executed: AtomicU64,
-    pub total_task_exec_time: AtomicU64,
-    pub ewma_exec_time_per_task_cost: AtomicU64,
+    pub total_task_exec_time: AtomicF64,
+    pub ewma_exec_time_per_task_cost: AtomicF64,
 }
 
 impl WorkerStats {
     /// Update the exponentially weighted `moving average` of execution time
     /// per cost unit, i.e. observed nanos per unit of declared `TaskCost` weight.
     #[inline(always)]
-    fn update_ewa(&self, elapsed: u64, cost: u64) {
+    fn update_ewa(&self, elapsed: f64, cost: u64) {
         // formula; new_ewa = observed variable * alpha + old_ewa * (1 - alpha)
         const ALPHA: f64 = 1.0 / 8.0;
-        let variable = ((elapsed + (1 << cost.ilog2()) - 1) >> cost.ilog2()) as f64; // std div_ceil() does "/" and "%" operations
-        let current = self.ewma_exec_time_per_task_cost.load(Ordering::Relaxed) as f64;
-        let new_ewa = ALPHA * (variable) + (1.0 - ALPHA) * current;
+        let variable = elapsed.algebraic_div(cost as f64);
+        let current = self.ewma_exec_time_per_task_cost.load(Ordering::Relaxed);
+        let new_ewa = ALPHA.algebraic_mul(variable) + (1.0 - ALPHA).algebraic_mul(current);
         self.ewma_exec_time_per_task_cost
-            .store(new_ewa as u64, Ordering::Relaxed);
+            .store(new_ewa, Ordering::Relaxed);
     }
 }

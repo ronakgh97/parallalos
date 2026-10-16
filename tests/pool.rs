@@ -20,9 +20,9 @@ fn wait_until(mut cond: impl FnMut() -> bool) -> bool {
 
 fn assert_balanced(p: &WorkerPool) {
     assert!(
-        wait_until(|| p.stats().iter().all(|w| w.tasks_cost == 0)),
+        wait_until(|| p.state().iter().all(|w| w.tasks_cost == 0)),
         "task_load never balanced: {:?}",
-        p.stats()
+        p.state()
     );
 }
 
@@ -49,9 +49,9 @@ fn loads_balance_after_all_tasks_complete() {
     }
 
     assert!(
-        p.stats().iter().all(|w| w.tasks_cost == 0),
+        p.state().iter().all(|w| w.tasks_cost == 0),
         "unbalanced loads: {:?}",
-        p.stats()
+        p.state()
     );
 }
 
@@ -170,9 +170,9 @@ fn concurrent_submit_balances() {
     assert_eq!(actual, expected);
 
     assert!(
-        wait_until(|| p.stats().iter().all(|w| w.tasks_cost == 0)),
+        wait_until(|| p.state().iter().all(|w| w.tasks_cost == 0)),
         "task_load never balanced: {:?}",
-        p.stats()
+        p.state()
     );
 }
 
@@ -200,7 +200,7 @@ fn batch_spreads_work_across_all_workers() {
         let _ = handle.wait().unwrap();
     }
 
-    let executed: Vec<u64> = p.stats().iter().map(|w| w.tasks_executed).collect();
+    let executed: Vec<u64> = p.state().iter().map(|w| w.tasks_executed).collect();
     assert!(
         executed.iter().all(|&n| n == TASKS as u64 / WORKERS as u64),
         "LPT should spread the batch evenly, got {executed:?}"
@@ -224,7 +224,7 @@ fn batch_with_uniform_costs_spreads_evenly() {
         let _ = handle.wait().unwrap();
     }
 
-    let executed: Vec<u64> = p.stats().iter().map(|w| w.tasks_executed).collect();
+    let executed: Vec<u64> = p.state().iter().map(|w| w.tasks_executed).collect();
     assert!(
         executed.iter().all(|&n| n > 0),
         "some worker got no work at all: {executed:?}"
@@ -262,7 +262,7 @@ fn wait_all_tasks_waits_for_queued_and_running() {
 
     p.wait_all().unwrap();
 
-    let stats = p.stats();
+    let stats = p.state();
     assert!(
         stats.iter().all(|w| w.tasks_cost == 0),
         "pool not drained: {stats:?}"
@@ -303,14 +303,14 @@ fn perf_regress_reference_single() {
             .unwrap();
         }
     }
-    println!("{:?}", p.stats());
+    println!("{:?}", p.state());
     p.wait_all().unwrap();
     let elapsed = start.elapsed();
 
     println!("makespan for {TASK_COUNT} tasks: {:?}", elapsed);
     println!(
         "busy worker time for {TASK_COUNT} tasks: {:?}",
-        p.stats().iter().map(|w| w.tasks_exec_time).sum::<u64>()
+        p.state().iter().map(|w| w.tasks_exec_time).sum::<f64>()
     );
 
     let baseline = Duration::from_millis(150);
@@ -349,14 +349,14 @@ fn perf_regress_reference_batch() {
 
     let start = Instant::now();
     drop(p.submit_batch(tasks).unwrap());
-    println!("{:?}", p.stats());
+    println!("{:?}", p.state());
     p.wait_all().unwrap();
     let elapsed = start.elapsed();
 
     println!("makespan for {TASK_COUNT} tasks: {:?}", elapsed);
     println!(
         "busy worker time for {TASK_COUNT} tasks: {:?}",
-        p.stats().iter().map(|w| w.tasks_exec_time).sum::<u64>()
+        p.state().iter().map(|w| w.tasks_exec_time).sum::<f64>()
     );
 
     assert!(
