@@ -2,6 +2,7 @@ use crate::Task;
 use crate::tasks::{TaskCost, TaskHandle, TaskResult};
 use crate::worker::{WorkerHandle, init_worker};
 use anyhow::{Result, anyhow};
+use std::cmp::Ordering as CmpOrdering;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
@@ -33,7 +34,7 @@ pub struct WorkerPool {
 
 /// Snapshot of a worker's current state, used for `monitoring` and `scheduling` decisions
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
 pub struct WorkerState {
     pub tasks_cost: u64,
     pub tasks_queued: u64,
@@ -47,13 +48,16 @@ impl WorkerPool {
     /// Creates a new worker pool with the number of threads equal to the `number of available CPU cores`.
     pub fn init() -> Result<Self> {
         let thread_count = std::thread::available_parallelism()?.get();
-        assert!(thread_count > 1, "worker pool must have at least 2 threads");
+        assert!(
+            thread_count >= 2,
+            "worker pool must have at least 2 threads"
+        );
         Self::init_with(thread_count)
     }
 
     /// Creates a new worker pool with the `specified number of threads`.
     pub fn init_with(n: usize) -> Result<Self> {
-        assert!(n > 1, "worker pool must have at least 2 threads");
+        assert!(n >= 2, "worker pool must have at least 2 threads");
 
         // workers signal on this channel after all task queued are drained,
         // so that the pool shutdown can wake up when all workers are idle and close gracefully
@@ -135,7 +139,7 @@ impl WorkerPool {
     /// i.e. how heavy the task is expected to be, in range of `Low` to `VeryHigh`
     /// and returns a handle for awaiting its result or errors if Pool is shut down.
     ///
-    /// This uses `List Scheduling` with `Online Approximation` (Power of Two Choices instead of full scan)
+    /// This uses `List Scheduling` with `Online Approximation` (instead of full scan)
     /// and `Uniform "Machine" Scheduling` to select a worker thread for executing the task.
     /// Uniform Scheduling means there scheduler accounts for the `predicted completion time` of each worker.
     /// This may `increase makespan`, but `minimizes the total busy time` of workers in most cases.
@@ -177,13 +181,16 @@ impl WorkerPool {
                     .load(Ordering::Relaxed),
             );
 
-            if rank_a > rank_b {
-                b
-            } else if rank_a < rank_b {
-                a
-            } else {
-                let coin_flip = fastrand::bool(); // 50/50 on tie
-                if coin_flip { a } else { b }
+            match rank_a.total_cmp(&rank_b) {
+                CmpOrdering::Less => a,
+                CmpOrdering::Greater => b,
+                CmpOrdering::Equal => {
+                    if fastrand::bool() {
+                        a
+                    } else {
+                        b
+                    }
+                }
             }
         };
 
