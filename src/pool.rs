@@ -85,7 +85,9 @@ impl WorkerPool {
     // TODO: fn remove_worker()
 
     #[inline(always)]
-    pub(crate) fn submit_to_worker<F, T>(
+    /// Submits a task to the worker at the given index of the worker pool.
+    /// This ignores the scheduling policy and submits the task immediately to the chosen worker.
+    pub fn submit_to_worker<F, T>(
         &self,
         index: usize,
         task: F,
@@ -95,6 +97,10 @@ impl WorkerPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
+        // assert!(
+        //     index < self.worker_handles.len(),
+        //     "pool does not have {index} workers"
+        // );
         let cost_value = cost.to_value();
         let worker_tx_handle = &self.worker_handles[index];
         worker_tx_handle
@@ -169,17 +175,21 @@ impl WorkerPool {
             // uniform machine scheduling here; basically, select worker to optimize makespan
             // the rank is a predicted time (in nanos) to drain this worker task queue
             let (wa, wb) = (&self.worker_handles[a], &self.worker_handles[b]);
-            let rank_a = (wa.stats.total_task_cost.load(Ordering::Relaxed) as f64).algebraic_mul(
-                wa.stats
-                    .ewma_exec_time_per_task_cost
-                    .load(Ordering::Relaxed),
-            );
+            let rank_a = (wa.stats.total_task_cost.load(Ordering::Relaxed) as f64)
+                .algebraic_add(cost.to_value() as f64)
+                .algebraic_mul(
+                    wa.stats
+                        .ewma_exec_time_per_task_cost
+                        .load(Ordering::Relaxed),
+                );
 
-            let rank_b = (wb.stats.total_task_cost.load(Ordering::Relaxed) as f64).algebraic_mul(
-                wb.stats
-                    .ewma_exec_time_per_task_cost
-                    .load(Ordering::Relaxed),
-            );
+            let rank_b = (wb.stats.total_task_cost.load(Ordering::Relaxed) as f64)
+                .algebraic_add(cost.to_value() as f64)
+                .algebraic_mul(
+                    wb.stats
+                        .ewma_exec_time_per_task_cost
+                        .load(Ordering::Relaxed),
+                );
 
             match rank_a.total_cmp(&rank_b) {
                 CmpOrdering::Less => a,
@@ -217,32 +227,38 @@ impl WorkerPool {
         tasks.sort_by_key(|(_, cost)| std::cmp::Reverse(cost.to_value()));
 
         // load all workers instant state
-        let mut workers_load: Vec<f64> = self
+        let mut worker_states: Vec<(f64 /* load */, f64 /* ewma per cost */)> = self
             .worker_handles
             .iter()
             .map(|w| {
-                (w.stats.total_task_cost.load(Ordering::Relaxed) as f64)
-                    .algebraic_mul(w.stats.ewma_exec_time_per_task_cost.load(Ordering::Relaxed))
+                let total_cost = w.stats.total_task_cost.load(Ordering::Relaxed) as f64;
+                let ewma_per_cost = w.stats.ewma_exec_time_per_task_cost.load(Ordering::Relaxed);
+                (total_cost * ewma_per_cost, ewma_per_cost)
             })
             .collect();
 
         // submit each task to the least loaded worker, and
         // update the load of that worker for reconciling the next task placement
         let mut handles = Vec::with_capacity(tasks.len());
-        // TODO: consider perf overhead here
         for (func, cost) in tasks {
-            let cost_value = cost.to_value();
-            let Some(index) = workers_load
+            let cost_value = cost.to_value() as f64;
+
+            let Some(index) = worker_states
                 .iter()
                 .enumerate()
-                .min_by(|(_, a), (_, b)| a.total_cmp(b)) // find the least "loaded" worker
+                .min_by(|(_, (load_a, ewma_a)), (_, (load_b, ewma_b))| {
+                    let finish_a = load_a.algebraic_add(cost_value).algebraic_mul(*ewma_a);
+                    let finish_b = load_b.algebraic_add(cost_value).algebraic_mul(*ewma_b);
+                    finish_a.total_cmp(&finish_b) // find the worker with the least finish time
+                })
                 .map(|(index, _)| index)
             else {
-                return Err(anyhow!("worker pool has been shut down mid-batch"));
+                return Err(anyhow!("worker pool has been shut down"));
             };
 
             handles.push(self.submit_to_worker(index, func, cost)?);
-            workers_load[index] += cost_value as f64; // update the load of the selected worker
+            let (load, ewma) = &mut worker_states[index];
+            *load += cost_value * *ewma; // update the load of the selected worker
         }
         Ok(handles)
     }

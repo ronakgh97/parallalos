@@ -6,7 +6,7 @@ this [wiki page](https://en.wikipedia.org/wiki/Category:Scheduling_algorithms)
 Currently, the scheduler more or less implements `list scheduling` algorithm with `longest-processing-time-first` (LPT)
 heuristic.
 
-> Nested parallelism is not implemented, anything weird can lead to deadlocks.
+> Nested parallelism is not implemented, anything weird or funny can lead to deadlocks 💀.
 
 References:
 
@@ -30,32 +30,30 @@ running 4168 tasks with 16 workers (payload 34 MB)
 
 worker   tasks        busy     util
 ------------------------------------
-    0     265      113.12s    99.52%
-    1     292      112.38s    98.88%
-    2     235      112.56s    99.03%
-    3     244      112.96s    99.38%
-    4     234      111.15s    97.79%
-    5     241      112.12s    98.65%
-    6     268      113.66s   100.00%
-    7     249      111.81s    98.37%
-    8     238      112.59s    99.06%
-    9     287      113.41s    99.78%
-   10     261      112.51s    98.99%
-   11     282      112.43s    98.92%
-   12     293      113.50s    99.86%
-   13     239      111.15s    97.79%
-   14     286      113.55s    99.90%
-   15     254      112.20s    98.71%
+    0     284      103.45s   100.00%
+    1     241      100.99s    97.62%
+    2     281      102.95s    99.52%
+    3     270      103.22s    99.77%
+    4     258      102.67s    99.24%
+    5     228      101.10s    97.73%
+    6     241      101.63s    98.24%
+    7     224      101.59s    98.20%
+    8     256      101.94s    98.53%
+    9     261      101.99s    98.59%
+   10     255      103.03s    99.60%
+   11     284      103.08s    99.64%
+   12     264      101.18s    97.80%
+   13     258      102.77s    99.34%
+   14     284      102.72s    99.29%
+   15     279      102.51s    99.09%
 ------------------------------------
-hex: 171.786 sec (9.54%) 
-sha: 22.062 sec (1.22%) 
-aes: 42.646 sec (2.37%) 
-zstd: 1564.586 sec (86.87%)
+hex: 173.694 sec (10.61%)
+sha: 24.152 sec (1.48%)
+aes: 37.029 sec (2.26%)
+zstd: 1401.916 sec (85.65%)
 
-achieved makespan: 113.663 sec
-ideal makespan: 112.570 sec
-total busy: 1801.113 sec
-total util: 99.04%
-
-# last updated: 10-20-2026
+achieved makespan: 103.453 sec
+ideal makespan: 102.301 sec
+total busy: 1636.823 sec
+total util: 98.89%
 ```
