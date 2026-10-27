@@ -125,6 +125,46 @@ pub fn spawn<F: FnOnce() + Send + 'static>(
     pool.submit_with(task, cost)
 }
 
+/// Waits for one provided task to `finish first` and returns its result and the remaining handles.
+///
+/// Remaining handles keep their relative order, no tasks are cancelled and handles not passed here are unaffected.
+/// If several results are ready, one is chosen randomly.
+/// A selected task's panic is re-raised, dropping the remaining handles during unwinding.
+pub fn finish_first<T>(
+    handles: impl IntoIterator<Item = TaskHandle<T>>,
+) -> (anyhow::Result<(T, usize)>, Vec<TaskHandle<T>>) {
+    use crate::tasks::TaskResult;
+    use crossbeam::channel::Select;
+
+    let mut handles: Vec<_> = handles.into_iter().collect();
+    if handles.is_empty() {
+        return (
+            Err(anyhow::anyhow!("finish_first requires at least one task")),
+            handles,
+        );
+    }
+
+    let (index, result) = {
+        let mut select = Select::default();
+        for handle in &handles {
+            select.recv(&handle.rx);
+        }
+
+        let operation = select.select();
+        let index = operation.index();
+        let result = operation.recv(&handles[index].rx);
+        (index, result)
+    };
+    handles.remove(index);
+
+    let result = match result {
+        Ok(TaskResult::Success(value, worker_id)) => Ok((value, worker_id)),
+        Ok(TaskResult::Panic(payload)) => std::panic::resume_unwind(payload),
+        Err(_) => Err(anyhow::anyhow!("task {index} failed to send its result")),
+    };
+    (result, handles)
+}
+
 #[test]
 fn lib_test() {
     init_global_pool();
@@ -161,4 +201,22 @@ fn lib_test() {
     .unwrap();
     let elapsed = time_taken.elapsed();
     assert!(elapsed < std::time::Duration::from_millis(225));
+
+    let task_1 = pool
+        .submit(|| {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            44
+        })
+        .unwrap();
+
+    let task_2 = pool
+        .submit(|| {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            97
+        })
+        .unwrap();
+
+    let (result, remaining) = finish_first([task_1, task_2]);
+    assert_eq!(result.unwrap().0, 97);
+    assert!(!remaining.is_empty());
 }
