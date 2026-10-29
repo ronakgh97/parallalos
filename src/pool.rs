@@ -4,15 +4,16 @@ use crate::worker::{WorkerHandle, init_worker};
 use anyhow::{Result, anyhow};
 use std::cmp::Ordering as CmpOrdering;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 
-/// Packs a callable function and a channel sender into a closure
+/// Packs a callable function, a state reference, and a channel sender into a closure
 /// that runs the task and sends back the result
 macro_rules! exec_task {
-    ($f:expr, $rtx:expr) => {
-        Box::new(move |worker_id: usize| {
-            let result = match catch_unwind(AssertUnwindSafe($f)) {
+    ($task:expr, $rtx:expr) => {
+        Box::new(move |state: &mut S, worker_id: usize| {
+            let result = match catch_unwind(AssertUnwindSafe(|| $task(state))) {
                 Ok(v) => TaskResult::Success(v, worker_id),
                 Err(e) => TaskResult::Panic(e),
             };
@@ -22,9 +23,9 @@ macro_rules! exec_task {
     };
 }
 
-/// A pool of worker threads that can schedule/execute tasks concurrently
-pub struct WorkerPool {
-    pub(crate) worker_handles: Box<[WorkerHandle]>,
+/// A pool of worker threads with optional worker-owned state, that can schedule/execute tasks concurrently
+pub struct WorkerPool<S: 'static = ()> {
+    pub(crate) worker_handles: Box<[WorkerHandle<S>]>,
     pub(crate) worker_threads: Box<[JoinHandle<()>]>,
     // this is needed for keeping channel alive, throughout the lifetime of the pool
     #[allow(unused)]
@@ -57,20 +58,45 @@ impl WorkerPool {
 
     /// Creates a new worker pool with the `specified number of threads`.
     pub fn init_with(n: usize) -> Result<Self> {
+        Self::init_with_state(n, || Ok(()))
+    }
+}
+
+impl<S: 'static> WorkerPool<S> {
+    /// Creates a new worker pool, initializing state once on each worker thread.
+    ///
+    /// The pool calls the state initializer once inside each worker thread, and waits for it to complete.
+    /// An error or panics with initialization clear dropped workers, joins the worker threads, and returns an error.
+    /// State is dropped on its owning worker during shutdown.
+    pub fn init_with_state<F>(n: usize, state_initializer: F) -> Result<Self>
+    where
+        F: Fn() -> Result<S> + Send + Sync + 'static,
+    {
         assert!(n >= 2, "worker pool must have at least 2 threads");
+        let initializer = Arc::new(state_initializer);
 
         // workers signal on this channel after all task queued are drained,
         // so that the pool shutdown can wake up when all workers are idle and close gracefully
         let (idle_tx, idle_rx) = crossbeam::channel::unbounded::<()>();
 
-        let mut handles = Vec::with_capacity(n);
-        let mut threads = Vec::with_capacity(n);
-        (0..n)
-            .map(|id| init_worker(id, idle_tx.clone()))
-            .for_each(|(worker, thread)| {
-                handles.push(worker);
-                threads.push(thread);
-            });
+        let mut handles: Vec<WorkerHandle<S>> = Vec::with_capacity(n);
+        let mut threads: Vec<JoinHandle<()>> = Vec::with_capacity(n);
+        for id in 0..n {
+            let initializer = Arc::clone(&initializer);
+            match init_worker(id, idle_tx.clone(), move || initializer()) {
+                Ok((worker, thread)) => {
+                    handles.push(worker);
+                    threads.push(thread);
+                }
+                Err(error) => {
+                    drop(handles); // drop all handles, threads will be joined
+                    for thread in threads {
+                        let _ = thread.join();
+                    }
+                    return Err(error);
+                }
+            }
+        }
 
         Ok(WorkerPool {
             worker_handles: handles.into_boxed_slice(),
@@ -85,8 +111,8 @@ impl WorkerPool {
     // TODO: fn remove_worker()
 
     #[inline(always)]
-    /// Submits a task to the worker at the given index of the worker pool.
-    /// This ignores the scheduling policy and submits the task immediately to the chosen worker.
+    /// Submits a task directly to the worker at the given index of the worker pool, preserving its queue order.
+    /// This ignores the scheduling policy and queues the task immediately to the chosen worker.
     pub fn submit_to_worker<F, T>(
         &self,
         index: usize,
@@ -97,12 +123,27 @@ impl WorkerPool {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        // assert!(
-        //     index < self.worker_handles.len(),
-        //     "pool does not have {index} workers"
-        // );
+        self.submit_to_worker_with_state(index, move |_| task(), cost)
+    }
+
+    #[inline(always)]
+    /// Submits a task directly to the worker at the given index of the worker pool,
+    /// similar to [`submit_to_worker`](Self::submit_to_worker) but with a state reference.
+    pub fn submit_to_worker_with_state<F, T>(
+        &self,
+        index: usize,
+        task: F,
+        cost: TaskCost,
+    ) -> Result<TaskHandle<T>>
+    where
+        F: FnOnce(&mut S) -> T + Send + 'static,
+        T: Send + 'static,
+    {
         let cost_value = cost.to_value();
-        let worker_tx_handle = &self.worker_handles[index];
+        let worker_tx_handle = self
+            .worker_handles
+            .get(index)
+            .ok_or_else(|| anyhow!("worker {index} is unavailable"))?;
         worker_tx_handle
             .stats
             .total_task_cost
@@ -132,7 +173,7 @@ impl WorkerPool {
 
     /// Submits a task to the pool with `TaskCost::Normal` and returns a handle to await its result.
     ///
-    /// Use `submit_with` for specifying a different cost and more details.
+    /// Use [`submit_with`](Self::submit_with) for specifying a different cost and see more details.
     pub fn submit<F, T>(&self, task: F) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
@@ -154,6 +195,24 @@ impl WorkerPool {
     pub fn submit_with<F, T>(&self, task: F, cost: TaskCost) -> Result<TaskHandle<T>>
     where
         F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with_state_and_cost(move |_| task(), cost)
+    }
+
+    /// Submits a task to the pool, similar to [`submit`](Self::submit), but with a state reference.
+    pub fn submit_with_state<F, T>(&self, task: F) -> Result<TaskHandle<T>>
+    where
+        F: FnOnce(&mut S) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_with_state_and_cost(task, TaskCost::Normal)
+    }
+
+    /// Submits a task to the pool, similar to [`submit_with`](Self::submit_with), but with a state reference and an explicit scheduling cost.
+    pub fn submit_with_state_and_cost<F, T>(&self, task: F, cost: TaskCost) -> Result<TaskHandle<T>>
+    where
+        F: FnOnce(&mut S) -> T + Send + 'static,
         T: Send + 'static,
     {
         let index = {
@@ -204,7 +263,7 @@ impl WorkerPool {
             }
         };
 
-        self.submit_to_worker(index, task, cost)
+        self.submit_to_worker_with_state(index, task, cost)
     }
 
     /// Submits a batch of tasks to the pool with their respective `TaskCost`,
@@ -220,6 +279,16 @@ impl WorkerPool {
     where
         I: Iterator<Item = (F, TaskCost)>,
         F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.submit_batch_with_state(tasks.map(|(task, cost)| (move |_: &mut S| task(), cost)))
+    }
+
+    /// Submits a batch of tasks to the pool, similar to [`submit_batch`](Self::submit_batch), but with a state reference.
+    pub fn submit_batch_with_state<I, F, T>(&self, tasks: I) -> Result<Vec<TaskHandle<T>>>
+    where
+        I: Iterator<Item = (F, TaskCost)>,
+        F: FnOnce(&mut S) -> T + Send + 'static,
         T: Send + 'static,
     {
         // sort descending by cost, LPT scheduling heuristic
@@ -256,7 +325,7 @@ impl WorkerPool {
                 return Err(anyhow!("worker pool has been shut down"));
             };
 
-            handles.push(self.submit_to_worker(index, func, cost)?);
+            handles.push(self.submit_to_worker_with_state(index, func, cost)?);
             let (load, ewma) = &mut worker_states[index];
             *load += cost_value * *ewma; // update the load of the selected worker
         }
@@ -361,7 +430,7 @@ impl WorkerPool {
     // TODO: fn shutdown_timeout()
 }
 
-impl Drop for WorkerPool {
+impl<S: 'static> Drop for WorkerPool<S> {
     fn drop(&mut self) {
         let _ = self.shutdown();
     }

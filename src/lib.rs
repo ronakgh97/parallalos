@@ -38,12 +38,13 @@ pub mod pool;
 pub mod tasks;
 pub(crate) mod worker;
 
+type TaskExecutor<S> = Box<dyn FnOnce(&mut S, usize) + Send + 'static>;
 /// A unit of work to be executed by a worker thread
-pub(crate) struct Task {
+pub(crate) struct Task<S = ()> {
     /// Enum that denotes how "costly" the task is
     pub cost: TaskCost,
-    /// Closure that capture callable and worker id that's executing it
-    pub exec: Box<dyn FnOnce(usize) + Send + 'static>,
+    /// Closure that captures the callable, state reference, and worker id that's executing it
+    pub exec: TaskExecutor<S>,
 }
 
 pub(crate) static GLOBAL_WORKER_POOL: std::sync::LazyLock<WorkerPool> =
@@ -216,7 +217,7 @@ fn lib_test() {
         })
         .unwrap();
 
-    let (result, remaining) = finish_first([task_1, task_2]);
-    assert_eq!(result.unwrap().0, 97);
-    assert!(!remaining.is_empty());
+    let (first, second) = finish_first([task_1, task_2]);
+    assert_eq!(first.unwrap().0, 97);
+    assert!(!second.is_empty());
 }
